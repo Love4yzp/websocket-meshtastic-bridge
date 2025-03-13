@@ -323,7 +323,7 @@ class MeshtasticBridge:
 
 def main():
     bridge = MeshtasticBridge(
-        serial_port='/dev/cu.usbmodemD83BDA45A9C81',
+        serial_port='/dev/ttyACM0',
         host='0.0.0.0',
         port=5800
     )

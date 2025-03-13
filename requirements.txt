@@ -1,4 +1,3 @@
-datetime
-websocket
-meshtastic
-pubsub
+meshtastic==2.5.12
+websockets
+pypubsub
