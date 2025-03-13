@@ -1,0 +1,232 @@
+[
+    {
+        "id": "text_handler",
+        "type": "function",
+        "z": "1182771921bf5c81",
+        "name": "处理文本消息",
+        "func": "// 提取关键信息\nconst {\n    fromId,     // 发送者ID\n    nodeNum,    // 节点编号\n    message,    // 消息内容\n    channel     // 频道\n} = msg.payload;\n\n// 设置消息上下文\nmsg.meshtastic = {\n    fromId,\n    nodeNum,\n    channel\n};\n\n// 只保留消息内容\nmsg.payload = message;\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 900,
+        "y": 700,
+        "wires": [
+            [
+                "message_router"
+            ]
+        ]
+    },
+    {
+        "id": "meshtastic_in",
+        "type": "websocket in",
+        "z": "1182771921bf5c81",
+        "name": "Meshtastic 接收",
+        "server": "",
+        "client": "meshtastic_ws",
+        "x": 500,
+        "y": 740,
+        "wires": [
+            [
+                "message_parser"
+            ]
+        ]
+    },
+    {
+        "id": "message_parser",
+        "type": "function",
+        "z": "1182771921bf5c81",
+        "name": "解析消息",
+        "func": "try {\n    const msg_obj = JSON.parse(msg.payload);\n    \n    // 根据消息类型分流\n    switch(msg_obj.type) {\n        case 'text':\n            msg.payload = msg_obj;\n            return [msg, null];\n            break;\n            \n        case 'position':\n            msg.payload = msg_obj;\n            return [null, msg];\n            break;\n            \n        default:\n            return [null, null];\n    }\n} catch (e) {\n    node.error(\"解析失败: \" + e.message);\n    return [null, null];\n}",
+        "outputs": 2,
+        "noerr": 0,
+        "x": 700,
+        "y": 740,
+        "wires": [
+            [
+                "text_handler",
+                "c53c87939227b787",
+                "971e10969bd4c017"
+            ],
+            [
+                "position_handler"
+            ]
+        ]
+    },
+    {
+        "id": "position_handler",
+        "type": "function",
+        "z": "1182771921bf5c81",
+        "name": "处理位置消息",
+        "func": "// 提取位置信息\nconst {\n    fromId,\n    nodeNum,\n    position\n} = msg.payload;\n\n// 转换为标准格式\nmsg.location = {\n    lat: position.latitude,\n    lon: position.longitude,\n    alt: position.altitude,\n    ts: new Date(position.time).getTime()\n};\n\nmsg.meshtastic = {\n    fromId,\n    nodeNum\n};\n\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "x": 900,
+        "y": 780,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "meshtastic_out",
+        "type": "websocket out",
+        "z": "1182771921bf5c81",
+        "name": "Meshtastic 发送",
+        "server": "",
+        "client": "meshtastic_ws",
+        "x": 1300,
+        "y": 920,
+        "wires": []
+    },
+    {
+        "id": "message_formatter",
+        "type": "function",
+        "z": "1182771921bf5c81",
+        "name": "格式化发送消息",
+        "func": "// 检查是否有目标信息\nif (!msg.meshtastic) {\n    node.error(\"缺少目标信息\");\n    return null;\n}\n\n// 构造发送消息\nconst outMsg = {\n    payload: {\n        message: msg.payload\n    }\n};\n\n// 添加目标信息\nif (msg.meshtastic.channel !== undefined) {\n    outMsg.payload.channel = msg.meshtastic.channel;\n} else if (msg.meshtastic.destination) {\n    outMsg.payload.destination = msg.meshtastic.destination;\n} else {\n    outMsg.payload.channel = 0;  // 默认频道\n}\n\nreturn outMsg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1120,
+        "y": 900,
+        "wires": [
+            [
+                "meshtastic_out"
+            ]
+        ]
+    },
+    {
+        "id": "message_input",
+        "type": "inject",
+        "z": "1182771921bf5c81",
+        "name": "测试消息",
+        "props": [
+            {
+                "p": "payload"
+            },
+            {
+                "p": "meshtastic",
+                "v": "{\"channel\":0}",
+                "vt": "json"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "test message",
+        "payloadType": "str",
+        "x": 920,
+        "y": 880,
+        "wires": [
+            [
+                "message_formatter"
+            ]
+        ]
+    },
+    {
+        "id": "message_router",
+        "type": "switch",
+        "z": "1182771921bf5c81",
+        "name": "TEXT 消息路由",
+        "property": "payload",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "regex",
+                "v": "^/position",
+                "vt": "str",
+                "case": false
+            },
+            {
+                "t": "regex",
+                "v": "^/status",
+                "vt": "str",
+                "case": false
+            },
+            {
+                "t": "else"
+            }
+        ],
+        "checkall": "true",
+        "repair": false,
+        "outputs": 3,
+        "x": 1120,
+        "y": 680,
+        "wires": [
+            [],
+            [],
+            [
+                "4305160e8e397678"
+            ]
+        ]
+    },
+    {
+        "id": "4305160e8e397678",
+        "type": "debug",
+        "z": "1182771921bf5c81",
+        "name": "debug 8",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1270,
+        "y": 740,
+        "wires": []
+    },
+    {
+        "id": "c53c87939227b787",
+        "type": "function",
+        "z": "1182771921bf5c81",
+        "name": "回传测试",
+        "func": "// 提取关键信息\nconst {\n    fromId,     // 发送者ID\n    nodeNum,    // 节点编号\n    message,    // 消息内容\n    channel     // 频道\n} = msg.payload;\n\nvar outMsg = {\n    payload:{\n        message: \"我收到了\"\n    },\n    // channel: channel,\n    destination: nodeNum\n}\n\nreturn outMsg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 900,
+        "y": 1020,
+        "wires": [
+            [
+                "meshtastic_out"
+            ]
+        ]
+    },
+    {
+        "id": "971e10969bd4c017",
+        "type": "debug",
+        "z": "1182771921bf5c81",
+        "name": "debug 9",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 860,
+        "y": 580,
+        "wires": []
+    },
+    {
+        "id": "meshtastic_ws",
+        "type": "websocket-client",
+        "path": "ws://host.docker.internal:8000",
+        "tls": "",
+        "wholemsg": "false",
+        "hb": "0",
+        "subprotocol": "",
+        "headers": []
+    }
+]
