@@ -3,7 +3,7 @@ build:
 push:
 	docker push sensecraft-missionpack.seeed.cn/suzhou/websocket-meshtastic-bridge:v0.2
 run:
-	docker run -d -p 5800:5800 --name websocket-meshtastic-bridge sensecraft-missionpack.seeed.cn/suzhou/websocket-meshtastic-bridge:v0.2
+	docker run -d -p 5800:5800 --device=/dev/ttyACM0:/dev/ttyACM0 --name websocket-meshtastic-bridge sensecraft-missionpack.seeed.cn/suzhou/websocket-meshtastic-bridge:v0.2
 down:
 	docker stop websocket-meshtastic-bridge && docker rm websocket-meshtastic-bridge
 logs:
