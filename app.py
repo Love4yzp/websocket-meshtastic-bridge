@@ -325,7 +325,7 @@ def main():
     bridge = MeshtasticBridge(
         serial_port='/dev/cu.usbmodemD83BDA45A9C81',
         host='0.0.0.0',
-        port=8000
+        port=5800
     )
     
     try:
