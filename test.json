@@ -222,7 +222,7 @@
     {
         "id": "meshtastic_ws",
         "type": "websocket-client",
-        "path": "ws://host.docker.internal:8000",
+        "path": "ws://host.docker.internal:5800",
         "tls": "",
         "wholemsg": "false",
         "hb": "0",
