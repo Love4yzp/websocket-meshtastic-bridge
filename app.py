@@ -18,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class MeshtasticBridge:
-    def __init__(self, serial_port: str, host: str = '0.0.0.0', port: int = 8000):
+    def __init__(self, serial_port: str, host: str = '0.0.0.0', port: int = 5800):
         self.serial_port = serial_port
         self.host = host
         self.port = port
