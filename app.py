@@ -9,6 +9,7 @@ from websockets.server import serve, WebSocketServerProtocol
 from meshtastic.serial_interface import SerialInterface
 from meshtastic import portnums_pb2
 from pubsub import pub
+from meshtastic.util import findPorts
 
 # 配置日志
 logging.basicConfig(
@@ -259,21 +260,28 @@ class MeshtasticBridge:
         """初始化 Meshtastic 接口"""
         try:
             logger.info(f"正在初始化 Meshtastic 接口，串口: {self.serial_port}")
+            logger.info("尝试创建 SerialInterface 实例...")
             self.interface = SerialInterface(self.serial_port)
+            logger.info("SerialInterface 实例创建成功")
             
             # 获取当前节点ID
+            logger.info("正在获取节点信息...")
             self.my_node_id = self.interface.getMyNodeInfo().get('nodeId', None)
             logger.info(f"当前节点ID: {self.my_node_id}")
             
+            logger.info("正在更新节点列表...")
             self.update_node_list()
+            logger.info("节点列表更新完成")
             
             # 订阅消息接收回调
+            logger.info("正在订阅消息接收事件...")
             pub.subscribe(self.on_meshtastic_receive, "meshtastic.receive")
             logger.info("已订阅 meshtastic.receive 事件")
             
             return True
         except Exception as e:
             logger.error(f"初始化 Meshtastic 接口失败: {str(e)}")
+            logger.exception("详细错误信息：")
             return False
     
     async def health_check(self):
@@ -282,26 +290,95 @@ class MeshtasticBridge:
             try:
                 if not self.interface:
                     logger.warning("Meshtastic 接口未连接，尝试连接...")
-                    self.init_meshtastic_interface()
+                    if self.init_meshtastic_interface():
+                        logger.info("Meshtastic 接口连接成功")
+                        await self._notify_connection_status(True)
                 else:
-                    # 通过检查 radioConfig 属性来验证连接状态
-                    try:
-                        if not hasattr(self.interface, '_SerialInterface__radioConfig'):
-                            raise Exception("接口未正确初始化")
-                        # 尝试获取一些基本信息来验证连接
-                        _ = self.interface.myInfo
-                    except Exception as e:
-                        logger.warning(f"连接可能已断开: {str(e)}")
-                        try:
-                            self.interface.close()
-                        except:
-                            pass
+                    # 检查连接状态
+                    is_healthy = await self._check_connection_health()
+                    if not is_healthy:
+                        logger.warning("检测到连接异常，尝试重新连接...")
+                        await self._safe_close_interface()
+                        await self._notify_connection_status(False)
                         self.interface = None
-                        continue
+                
             except Exception as e:
                 logger.error(f"健康检查出错: {str(e)}")
+                logger.exception("详细错误信息：")
             
             await asyncio.sleep(30)  # 30秒检查一次
+
+    async def _check_connection_health(self) -> bool:
+        """检查连接健康状态"""
+        try:
+            if not self.interface:
+                return False
+
+            # 尝试发送一个简单的请求（使用 asyncio 避免阻塞）
+            loop = asyncio.get_running_loop()
+            try:
+                # 设置超时时间为 3 秒
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, self._check_node_info),
+                    timeout=3.0
+                )
+                return True
+            except asyncio.TimeoutError:
+                logger.warning("获取节点信息超时")
+                return False
+            except Exception as e:
+                logger.warning(f"获取节点信息失败: {str(e)}")
+                return False
+
+        except Exception as e:
+            logger.error(f"健康检查过程出错: {str(e)}")
+            return False
+
+    def _check_node_info(self):
+        """检查节点信息（在执行器中运行）"""
+        try:
+            # 尝试获取节点信息来验证连接
+            node_info = self.interface.getMyNodeInfo()
+            if not node_info:
+                raise Exception("无法获取节点信息")
+            return True
+        except Exception as e:
+            logger.warning(f"节点信息检查失败: {str(e)}")
+            raise
+
+    async def _safe_close_interface(self):
+        """安全关闭接口"""
+        if self.interface:
+            try:
+                # 使用 asyncio 避免阻塞
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._close_interface)
+            except Exception as e:
+                logger.error(f"关闭接口时出错: {str(e)}")
+
+    def _close_interface(self):
+        """实际执行关闭操作"""
+        try:
+            # 1. 取消所有订阅
+            try:
+                pub.unsubscribe(self.on_meshtastic_receive, "meshtastic.receive")
+            except:
+                pass
+
+            # 2. 关闭串口连接
+            try:
+                self.interface.close()
+            except:
+                pass
+
+            # 3. 清理资源
+            self.interface = None
+            self.my_node_id = None
+            self.node_list = []
+
+        except Exception as e:
+            logger.error(f"清理资源时出错: {str(e)}")
+            raise
     
     async def start(self):
         """启动 WebSocket 服务器"""
@@ -322,18 +399,41 @@ class MeshtasticBridge:
             await asyncio.Future()  # 运行直到被取消
 
 def main():
-    bridge = MeshtasticBridge(
-        serial_port='/dev/ttyACM0',
-        host='0.0.0.0',
-        port=5800
-    )
-    
+    bridge = None
     try:
+        # 尝试自动查找串口
+        available_ports = findPorts()
+        
+        if not available_ports:
+            logger.error("未找到任何 Meshtastic 设备")
+            return
+            
+        if len(available_ports) > 1:
+            logger.warning(f"找到多个设备: {available_ports}")
+            logger.info(f"将使用第一个设备: {available_ports[0]}")
+            
+        serial_port = available_ports[0]
+        logger.info(f"自动选择串口: {serial_port}")
+        
+        bridge = MeshtasticBridge(
+            serial_port=serial_port,
+            host='0.0.0.0',
+            port=5800
+        )
+        
         asyncio.run(bridge.start())
     except KeyboardInterrupt:
         logger.info("程序被用户中断")
     except Exception as e:
         logger.error(f"程序异常退出: {str(e)}")
+        logger.exception("详细错误信息：")
+    finally:
+        if bridge and bridge.interface:
+            try:
+                bridge.interface.close()
+                logger.info("串口已关闭")
+            except:
+                pass
 
 if __name__ == "__main__":
     main()
