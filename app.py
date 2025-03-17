@@ -170,6 +170,11 @@ class MeshtasticBridge:
                 asyncio.run_coroutine_threadsafe(self.message_queue.put(msg_obj), self.loop)
                 logger.info(f"收到文本消息: {message} (来自: {from_id})")
                 
+            elif port_num == 'NODEINFO_APP':
+                # 处理节点信息更新
+                logger.info("收到节点信息更新")
+                self.update_node_list()
+                
             elif port_num == 'POSITION_APP':
                 # 如果需要处理位置信息，可以在这里添加
                 pass
