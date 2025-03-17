@@ -84,20 +84,31 @@ class MeshtasticBridge:
             if not message:
                 raise ValueError("消息内容不能为空")
             
-            logger.info(f"正在处理消息: message={message}, destination={destination}, channel={channel}")
+            # logger.info(f"正在处理消息: message={message}, destination={destination}, channel={channel}")
             
             success = self.send_to_meshtastic(
                 message=message,
                 destination=destination,
                 channel=channel
             )
-            if not success:
-                raise Exception("发送消息失败")
+            if success:
+                await self.broadcast_message({
+                    'type': 'success',
+                    'message': '消息发送成功'
+                })
+            else:
+                await self.broadcast_message({
+                    'type': 'error',
+                    'message': '发送消息失败'
+                })
                 
         except Exception as e:
             logger.error(f"处理客户端消息时出错: {str(e)}")
             logger.exception("详细错误信息：")
-            raise
+            await self.broadcast_message({
+                'type': 'error',
+                'message': str(e)
+            })
     
     def send_to_meshtastic(self, message: str, destination: Optional[str] = None, channel: Optional[int] = None) -> bool:
         """发送消息到 Meshtastic 网络"""
