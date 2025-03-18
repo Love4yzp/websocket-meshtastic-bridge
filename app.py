@@ -77,6 +77,19 @@ class MeshtasticBridge:
         try:
             logger.info(f"收到客户端消息: {data}")  # 记录收到的完整消息
             
+            # 检查是否是请求节点列表的命令
+            if data.get('type') == 'get_node_list':
+                logger.info("收到获取节点列表请求")
+                # 先更新节点列表
+                self.update_node_list()
+                # 然后发送给客户端
+                await self.broadcast_message({
+                    'type': 'node_list',
+                    'data': self.node_list
+                })
+                return
+            
+            # 处理发送消息的请求
             message = data.get('message', '')
             destination = data.get('destination')
             channel = data.get('channel', 0)
