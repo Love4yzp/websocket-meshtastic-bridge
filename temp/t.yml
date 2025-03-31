@@ -1,0 +1,21 @@
+meshtastic_message_rtu:
+  id: 1 # 消息ID 需要接受处理信息的对象
+  type: rtu # 消息类型
+  serial: 0 # 串口号
+  command: 命令
+    fc: 功能码
+    address: 地址
+    register: 寄存器
+    count: 数量
+    data: 数据
+  session: 1 # 会话ID
+  version: 1 # 版本号
+
+meshtastic_message_tcp:
+  id: 2 # 消息ID 需要接受处理信息的对象
+  type: tcp # 消息类型
+  ip: 127.0.0.1 # IP地址
+  port: 502 # 端口号
+  command: 命令
+
+

@@ -3,26 +3,31 @@ import json
 import logging
 import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Set
+import signal
 from websockets.server import serve, WebSocketServerProtocol
 from meshtastic.serial_interface import SerialInterface
 from meshtastic import portnums_pb2
 from pubsub import pub
 from meshtastic.util import findPorts
+from config import settings
+from models import MessageRequest, NodeInfo, WebSocketMessage, NodeList, MessageStatus
+import asyncio_throttle
 
 # 配置日志
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, settings.LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 class MeshtasticBridge:
-    def __init__(self, serial_port: str, host: str = '0.0.0.0', port: int = 5800):
-        self.serial_port = serial_port
-        self.host = host
-        self.port = port
+    def __init__(self):
+        self.serial_port = settings.SERIAL_PORT
+        self.host = settings.HOST
+        self.port = settings.PORT
         self.interface: Optional[SerialInterface] = None
         self.node_list: List[Dict] = []
         self.connected_clients: Set[WebSocketServerProtocol] = set()
@@ -30,39 +35,67 @@ class MeshtasticBridge:
         self.lock = threading.Lock()
         self.message_queue = asyncio.Queue()
         self.loop = None
-        self.my_node_id = None  # 添加当前节点ID
+        self.my_node_id = None
+        self.throttler = asyncio_throttle.Throttler(
+            rate_limit=settings.RATE_LIMIT_MESSAGES,
+            period=60.0
+        )
+        self.shutdown_event = asyncio.Event()
+        self.pending_messages: Dict[str, MessageStatus] = {}  # Track pending messages
         
     async def handle_client(self, websocket: WebSocketServerProtocol):
         """处理单个客户端连接"""
         try:
+            # 等待确保服务器完全启动
+            retry_count = 0
+            while not self.running and retry_count < 5:
+                await asyncio.sleep(1)
+                retry_count += 1
+                
+            if not self.running:
+                logger.error("服务器未完全启动，拒绝客户端连接")
+                await websocket.close(1013, "服务器未就绪")
+                return
+
             # 添加客户端到连接集合
             with self.lock:
                 self.connected_clients.add(websocket)
             logger.info(f"新客户端连接，当前连接数: {len(self.connected_clients)}")
             
-            # 发送初始节点列表
-            await websocket.send(json.dumps({
-                'type': 'node_list',
-                'data': self.node_list
-            }))
+            try:
+                # 发送初始节点列表
+                node_list = NodeList(nodes=[NodeInfo(**node) for node in self.node_list])
+                await websocket.send(WebSocketMessage(
+                    type='node_list',
+                    data=node_list.dict()
+                ).json())
+            except Exception as e:
+                logger.error(f"发送初始节点列表失败: {str(e)}")
+                return
             
             # 处理客户端消息
             async for message in websocket:
                 try:
-                    data = json.loads(message)
-                    await self.handle_client_message(data)
-                except json.JSONDecodeError:
-                    logger.error("收到无效的 JSON 消息")
-                    await websocket.send(json.dumps({
-                        'type': 'error',
-                        'message': '无效的消息格式'
-                    }))
+                    async with self.throttler:
+                        data = MessageRequest.parse_raw(message)
+                        await self.handle_client_message(data)
+                except asyncio_throttle.ThrottleError:
+                    await websocket.send(WebSocketMessage(
+                        type='error',
+                        message='消息发送过于频繁，请稍后再试'
+                    ).json())
+                except ValueError as e:
+                    logger.error(f"消息验证失败: {str(e)}")
+                    await websocket.send(WebSocketMessage(
+                        type='error',
+                        message=str(e)
+                    ).json())
                 except Exception as e:
                     logger.error(f"处理客户端消息时出错: {str(e)}")
-                    await websocket.send(json.dumps({
-                        'type': 'error',
-                        'message': str(e)
-                    }))
+                    await websocket.send(WebSocketMessage(
+                        type='error',
+                        message=str(e)
+                    ).json())
                     
         except Exception as e:
             logger.error(f"处理客户端连接时出错: {str(e)}")
@@ -72,397 +105,347 @@ class MeshtasticBridge:
                 self.connected_clients.remove(websocket)
             logger.info(f"客户端断开连接，当前连接数: {len(self.connected_clients)}")
     
-    async def handle_client_message(self, data: Dict):
+    async def handle_client_message(self, data: MessageRequest):
         """处理客户端发送的消息"""
         try:
-            logger.info(f"收到客户端消息: {data}")  # 记录收到的完整消息
+            if len(data.message) > settings.MAX_MESSAGE_LENGTH:
+                raise ValueError(f"消息长度超过限制 ({settings.MAX_MESSAGE_LENGTH} 字符)")
             
-            # 检查是否是请求节点列表的命令
-            if data.get('type') == 'get_node_list':
+            if data.type == 'get_node_list':
                 logger.info("收到获取节点列表请求")
-                # 先更新节点列表
                 self.update_node_list()
-                # 然后发送给客户端
-                await self.broadcast_message({
-                    'type': 'node_list',
-                    'data': self.node_list
-                })
+                node_list = NodeList(nodes=[NodeInfo(**node) for node in self.node_list])
+                await self.broadcast_message(WebSocketMessage(
+                    type='node_list',
+                    data=node_list.dict()
+                ))
                 return
+
+            # Generate message ID if not provided
+            message_id = data.message_id or str(uuid.uuid4())
             
-            # 处理发送消息的请求
-            message = data.get('message', '')
-            destination = data.get('destination')
-            channel = data.get('channel', 0)
-            
-            if not message:
-                raise ValueError("消息内容不能为空")
-            
-            # logger.info(f"正在处理消息: message={message}, destination={destination}, channel={channel}")
-            
-            success = self.send_to_meshtastic(
-                message=message,
-                destination=destination,
-                channel=channel
+            # Create message status
+            message_status = MessageStatus(
+                message_id=message_id,
+                sent_time=datetime.now(),
+                destination=data.destination,
+                channel=data.channel,
+                timeout=data.timeout
             )
+            
+            success = await self.send_to_meshtastic_with_ack(
+                message_id=message_id,
+                message=data.message,
+                destination=data.destination,
+                channel=data.channel,
+                require_ack=data.require_ack,
+                timeout=data.timeout
+            )
+            
             if success:
-                await self.broadcast_message({
-                    'type': 'success',
-                    'message': '消息发送成功'
-                })
+                await self.broadcast_message(WebSocketMessage(
+                    type='success',
+                    message='消息发送成功',
+                    data={'message_id': message_id}
+                ))
             else:
-                await self.broadcast_message({
-                    'type': 'error',
-                    'message': '发送消息失败'
-                })
+                await self.broadcast_message(WebSocketMessage(
+                    type='error',
+                    message='发送消息失败',
+                    data={'message_id': message_id}
+                ))
                 
         except Exception as e:
             logger.error(f"处理客户端消息时出错: {str(e)}")
             logger.exception("详细错误信息：")
-            await self.broadcast_message({
-                'type': 'error',
-                'message': str(e)
-            })
-    
-    def send_to_meshtastic(self, message: str, destination: Optional[str] = None, channel: Optional[int] = None) -> bool:
-        """发送消息到 Meshtastic 网络"""
+            await self.broadcast_message(WebSocketMessage(
+                type='error',
+                message=str(e)
+            ))
+
+    async def send_to_meshtastic_with_ack(self, message_id: str, message: str, 
+                                         destination: Optional[str] = None, 
+                                         channel: Optional[int] = None,
+                                         require_ack: bool = True,
+                                         timeout: float = 30.0) -> bool:
+        """发送消息到 Meshtastic 网络并等待确认"""
         if not self.interface:
             logger.error("Meshtastic 接口未初始化")
             return False
             
         try:
-            logger.info(f"准备发送消息: message={message}, destination={destination}, channel={channel}")
+            # Store message status
+            self.pending_messages[message_id] = MessageStatus(
+                message_id=message_id,
+                sent_time=datetime.now(),
+                destination=destination,
+                channel=channel,
+                timeout=timeout
+            )
             
-            # 验证目标节点是否存在（如果是 DM）
-            if destination:
-                if not destination.startswith('!'):
-                    logger.error(f"无效的目标节点ID格式: {destination}")
-                    return False
-                if destination not in self.interface.nodes:
-                    logger.error(f"目标节点不存在: {destination}")
-                    return False
-            
-            # 验证频道号（如果是广播）
-            if channel is not None and (channel < 0 or channel > 7):
-                logger.error(f"无效的频道号: {channel}")
+            # Send the message
+            success = self.send_to_meshtastic(message, destination, channel)
+            if not success:
+                del self.pending_messages[message_id]
                 return False
 
-            if destination:
-                # DM: 使用 nodeId 发送到特定节点
-                logger.info(f"尝试发送 DM 到节点 {destination}")
-                self.interface.sendText(
-                    text=message,
-                    destinationId=destination
+            if not require_ack:
+                del self.pending_messages[message_id]
+                return True
+
+            # Wait for acknowledgment
+            try:
+                await asyncio.wait_for(
+                    self._wait_for_ack(message_id),
+                    timeout=timeout
                 )
-                logger.info(f"DM 发送成功")
-            else:
-                # 广播: 在指定频道发送
-                logger.info(f"尝试在频道 {channel} 广播消息")
-                self.interface.sendText(
-                    text=message,
-                    channelIndex=channel if channel is not None else 0
-                )
-                logger.info(f"广播发送成功")
-            return True
+                return True
+            except asyncio.TimeoutError:
+                logger.warning(f"Message {message_id} timed out waiting for acknowledgment")
+                if message_id in self.pending_messages:
+                    self.pending_messages[message_id].status = "timeout"
+                return False
+            
         except Exception as e:
-            logger.error(f"发送消息到 Meshtastic 失败: {str(e)}")
-            logger.exception("详细错误信息：")
+            logger.error(f"发送消息失败: {str(e)}")
+            if message_id in self.pending_messages:
+                self.pending_messages[message_id].status = "failed"
             return False
-    
+
+    async def _wait_for_ack(self, message_id: str):
+        """等待消息确认"""
+        while True:
+            if message_id not in self.pending_messages:
+                raise Exception("Message not found")
+                
+            if self.pending_messages[message_id].ack_received:
+                self.pending_messages[message_id].status = "delivered"
+                del self.pending_messages[message_id]
+                return
+                
+            await asyncio.sleep(0.1)
+
     def on_meshtastic_receive(self, packet: Dict, interface: SerialInterface):
-        """处理从 Meshtastic 接收到的消息（同步版本）"""
+        """处理从 Meshtastic 接收到的消息"""
         try:
             port_num = packet['decoded']['portnum']
+            from_id = packet['fromId']
             
-            # 只处理我们关心的消息类型
+            # Handle text messages
             if port_num == 'TEXT_MESSAGE_APP':
                 message = packet['decoded']['payload'].decode('utf-8')
-                from_id = packet['fromId']
                 node_info = self.interface.nodes.get(from_id, {})
                 
-                msg_obj = {
-                    'type': 'text',
-                    'fromId': from_id,
-                    'nodeNum': node_info.get('num', 0),
-                    'shortName': node_info.get('user', {}).get('shortName', ''),
-                    'longName': node_info.get('user', {}).get('longName', ''),
-                    'channel': packet.get('channel', 0),
-                    'message': message,
-                    'timestamp': datetime.now().isoformat()
-                }
+                # 生成消息ID用于响应
+                received_message_id = str(uuid.uuid4())
                 
-                # 转发到 WebSocket
-                asyncio.run_coroutine_threadsafe(self.message_queue.put(msg_obj), self.loop)
-                logger.info(f"收到文本消息: {message} (来自: {from_id})")
+                # Check if this is an acknowledgment message
+                if message.startswith('ACK:'):
+                    ack_message_id = message[4:]
+                    if ack_message_id in self.pending_messages:
+                        self.pending_messages[ack_message_id].ack_received = True
+                        logger.info(f"收到消息确认 ID: {ack_message_id}")
+                        return
+
+                # Regular message - send acknowledgment
+                try:
+                    logger.info(f"发送消息确认到 {from_id}")
+                    self.interface.sendText(
+                        text=f"ACK:{received_message_id}",
+                        destinationId=from_id
+                    )
+                except Exception as e:
+                    logger.error(f"发送确认失败: {str(e)}")
+                
+                # Forward message to WebSocket clients
+                msg_obj = WebSocketMessage(
+                    type='text',
+                    data={
+                        'messageId': received_message_id,
+                        'fromId': from_id,
+                        'nodeNum': node_info.get('num', 0),
+                        'shortName': node_info.get('user', {}).get('shortName', ''),
+                        'longName': node_info.get('user', {}).get('longName', ''),
+                        'channel': packet.get('channel', 0),
+                        'message': message,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                )
+                
+                asyncio.run_coroutine_threadsafe(
+                    self.message_queue.put(msg_obj.dict()),
+                    self.loop
+                )
+                logger.info(f"消息已转发到WebSocket客户端，来自: {from_id}")
                 
             elif port_num == 'NODEINFO_APP':
-                # 处理节点信息更新
-                logger.info("收到节点信息更新")
                 self.update_node_list()
-                
-            elif port_num == 'POSITION_APP':
-                # 如果需要处理位置信息，可以在这里添加
-                pass
-            else:
-                # 对于其他类型的消息，只记录日志但不转发
-                logger.debug(f"收到未处理的消息类型: {port_num}")
+                logger.info("节点信息已更新")
                 
         except Exception as e:
             logger.error(f"处理 Meshtastic 消息时出错: {str(e)}")
-
-    def _get_message_type(self, port_num: str) -> str:
-        """根据端口号获取消息类型"""
-        type_mapping = {
-            'TEXT_MESSAGE_APP': 'text',
-            'POSITION_APP': 'position',
-            'NODEINFO_APP': 'nodeinfo',
-            'ROUTING_APP': 'routing',
-            'ADMIN_APP': 'admin',
-            'TELEMETRY_APP': 'telemetry',
-            'REMOTEHARD_APP': 'remote',
-            'SIMULATOR_APP': 'simulator'
-            # 可以根据需要添加更多类型
-        }
-        return type_mapping.get(port_num, 'unknown')
+            logger.exception("详细错误信息：")
     
+    def init_meshtastic_interface(self) -> bool:
+        """初始化 Meshtastic 接口"""
+        for attempt in range(settings.RECONNECT_ATTEMPTS):
+            try:
+                logger.info(f"正在初始化 Meshtastic 接口，串口: {self.serial_port} (尝试 {attempt + 1}/{settings.RECONNECT_ATTEMPTS})")
+                
+                if self.serial_port is None:
+                    ports = findPorts()
+                    if not ports:
+                        raise ValueError("未找到 Meshtastic 设备")
+                    self.serial_port = ports[0]
+                    logger.info(f"自动选择串口: {self.serial_port}")
+                
+                self.interface = SerialInterface(self.serial_port)
+                
+                # 等待接口初始化完成
+                retry = 0
+                while not self.interface.nodes and retry < 10:
+                    logger.info("等待节点信息初始化...")
+                    time.sleep(1)
+                    retry += 1
+                
+                if not self.interface.nodes:
+                    raise ValueError("节点信息初始化超时")
+                
+                self.my_node_id = self.interface.getMyNodeInfo().get('nodeId', None)
+                if not self.my_node_id:
+                    raise ValueError("无法获取本机节点ID")
+                    
+                logger.info(f"当前节点ID: {self.my_node_id}")
+                
+                self.update_node_list()
+                pub.subscribe(self.on_meshtastic_receive, "meshtastic.receive")
+                logger.info("Meshtastic 接口初始化成功")
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"初始化失败: {str(e)}")
+                if self.interface:
+                    try:
+                        self.interface.close()
+                    except:
+                        pass
+                    self.interface = None
+                    
+                if attempt < settings.RECONNECT_ATTEMPTS - 1:
+                    logger.info(f"等待 {settings.RECONNECT_DELAY} 秒后重试...")
+                    time.sleep(settings.RECONNECT_DELAY)
+                else:
+                    logger.error("已达到最大重试次数，初始化失败")
+                    return False
+
     async def process_message_queue(self):
         """处理消息队列中的消息"""
         while self.running:
             try:
                 message = await self.message_queue.get()
-                await self.broadcast_message(message)
+                if not isinstance(message, dict):
+                    message = message.dict()
+                await self.broadcast_message(WebSocketMessage(**message))
+                self.message_queue.task_done()
             except Exception as e:
                 logger.error(f"处理消息队列时出错: {str(e)}")
-    
-    async def broadcast_message(self, message: Dict):
-        """广播消息到所有连接的客户端"""
-        with self.lock:
-            disconnected_clients = set()
-            for client in self.connected_clients:
-                try:
-                    await client.send(json.dumps(message))
-                except Exception as e:
-                    logger.error(f"发送消息到客户端失败: {str(e)}")
-                    disconnected_clients.add(client)
+                logger.exception("详细错误信息：")
+            await asyncio.sleep(0.1)  # 避免CPU过度使用
             
-            # 移除断开的客户端
-            self.connected_clients -= disconnected_clients
-    
     def update_node_list(self):
         """更新节点列表"""
         try:
-            if self.interface:
-                node_info = self.interface.nodes
-                self.node_list = [
-                    {
-                        'id': node_id,
-                        'user': {
-                            'shortName': node.get('user', {}).get('shortName', 'Unknown'),
-                            'longName': node.get('user', {}).get('longName', ''),
-                            'macaddr': node.get('user', {}).get('macaddr', ''),
-                            'hwModel': node.get('user', {}).get('hwModel', ''),
-                        },
-                        'position': {
-                            'latitude': node.get('position', {}).get('latitude', 0),
-                            'longitude': node.get('position', {}).get('longitude', 0),
-                            'altitude': node.get('position', {}).get('altitude', 0),
-                            'time': node.get('position', {}).get('time', 0),
-                        },
-                        'deviceMetrics': {
-                            'batteryLevel': node.get('deviceMetrics', {}).get('batteryLevel', 0),
-                            'voltage': node.get('deviceMetrics', {}).get('voltage', 0),
-                            'channelUtilization': node.get('deviceMetrics', {}).get('channelUtilization', 0),
-                            'airUtilTx': node.get('deviceMetrics', {}).get('airUtilTx', 0),
-                        },
-                        'nodeId': node.get('nodeId', 0),
-                        'snr': node.get('snr', 0),
-                        'lastHeard': node.get('lastHeard', 0),
-                        'rssi': node.get('rssi', 0),
-                        'channel': node.get('channel', 0)
-                    }
-                    for node_id, node in node_info.items()
-                ]
-                logger.info(f"节点列表已更新，共 {len(self.node_list)} 个节点")
+            if not self.interface:
+                logger.error("Meshtastic 接口未初始化")
+                return
+                
+            node_info = self.interface.nodes
+            self.node_list = [
+                {
+                    'id': node_id,
+                    'user': {
+                        'shortName': node.get('user', {}).get('shortName', 'Unknown'),
+                        'longName': node.get('user', {}).get('longName', ''),
+                        'macaddr': node.get('user', {}).get('macaddr', ''),
+                        'hwModel': node.get('user', {}).get('hwModel', ''),
+                    },
+                    'position': {
+                        'latitude': node.get('position', {}).get('latitude', 0),
+                        'longitude': node.get('position', {}).get('longitude', 0),
+                        'altitude': node.get('position', {}).get('altitude', 0),
+                        'time': node.get('position', {}).get('time', 0),
+                    },
+                    'deviceMetrics': {
+                        'batteryLevel': node.get('deviceMetrics', {}).get('batteryLevel', 0),
+                        'voltage': node.get('deviceMetrics', {}).get('voltage', 0),
+                        'channelUtilization': node.get('deviceMetrics', {}).get('channelUtilization', 0),
+                        'airUtilTx': node.get('deviceMetrics', {}).get('airUtilTx', 0),
+                    },
+                    'nodeId': node.get('nodeId', ''),
+                    'num': node.get('num', 0),
+                    'snr': node.get('snr', 0),
+                    'lastHeard': node.get('lastHeard', 0),
+                    'rssi': node.get('rssi', 0),
+                    'channel': node.get('channel', 0)
+                }
+                for node_id, node in node_info.items()
+            ]
+            logger.info(f"节点列表已更新，共 {len(self.node_list)} 个节点")
         except Exception as e:
             logger.error(f"更新节点列表失败: {str(e)}")
-    
-    def init_meshtastic_interface(self) -> bool:
-        """初始化 Meshtastic 接口"""
-        try:
-            logger.info(f"正在初始化 Meshtastic 接口，串口: {self.serial_port}")
-            logger.info("尝试创建 SerialInterface 实例...")
-            self.interface = SerialInterface(self.serial_port)
-            logger.info("SerialInterface 实例创建成功")
-            
-            # 获取当前节点ID
-            logger.info("正在获取节点信息...")
-            self.my_node_id = self.interface.getMyNodeInfo().get('nodeId', None)
-            logger.info(f"当前节点ID: {self.my_node_id}")
-            
-            logger.info("正在更新节点列表...")
-            self.update_node_list()
-            logger.info("节点列表更新完成")
-            
-            # 订阅消息接收回调
-            logger.info("正在订阅消息接收事件...")
-            pub.subscribe(self.on_meshtastic_receive, "meshtastic.receive")
-            logger.info("已订阅 meshtastic.receive 事件")
-            
-            return True
-        except Exception as e:
-            logger.error(f"初始化 Meshtastic 接口失败: {str(e)}")
             logger.exception("详细错误信息：")
-            return False
-    
-    async def health_check(self):
-        """健康检查和重连机制"""
-        while self.running:
-            try:
-                if not self.interface:
-                    logger.warning("Meshtastic 接口未连接，尝试连接...")
-                    if self.init_meshtastic_interface():
-                        logger.info("Meshtastic 接口连接成功")
-                        await self._notify_connection_status(True)
-                else:
-                    # 检查连接状态
-                    is_healthy = await self._check_connection_health()
-                    if not is_healthy:
-                        logger.warning("检测到连接异常，尝试重新连接...")
-                        await self._safe_close_interface()
-                        await self._notify_connection_status(False)
-                        self.interface = None
-                
-            except Exception as e:
-                logger.error(f"健康检查出错: {str(e)}")
-                logger.exception("详细错误信息：")
-            
-            await asyncio.sleep(30)  # 30秒检查一次
-
-    async def _check_connection_health(self) -> bool:
-        """检查连接健康状态"""
-        try:
-            if not self.interface:
-                return False
-
-            # 尝试发送一个简单的请求（使用 asyncio 避免阻塞）
-            loop = asyncio.get_running_loop()
-            try:
-                # 设置超时时间为 3 秒
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, self._check_node_info),
-                    timeout=3.0
-                )
-                return True
-            except asyncio.TimeoutError:
-                logger.warning("获取节点信息超时")
-                return False
-            except Exception as e:
-                logger.warning(f"获取节点信息失败: {str(e)}")
-                return False
-
-        except Exception as e:
-            logger.error(f"健康检查过程出错: {str(e)}")
-            return False
-
-    def _check_node_info(self):
-        """检查节点信息（在执行器中运行）"""
-        try:
-            # 尝试获取节点信息来验证连接
-            node_info = self.interface.getMyNodeInfo()
-            if not node_info:
-                raise Exception("无法获取节点信息")
-            return True
-        except Exception as e:
-            logger.warning(f"节点信息检查失败: {str(e)}")
-            raise
-
-    async def _safe_close_interface(self):
-        """安全关闭接口"""
-        if self.interface:
-            try:
-                # 使用 asyncio 避免阻塞
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._close_interface)
-            except Exception as e:
-                logger.error(f"关闭接口时出错: {str(e)}")
-
-    def _close_interface(self):
-        """实际执行关闭操作"""
-        try:
-            # 1. 取消所有订阅
-            try:
-                pub.unsubscribe(self.on_meshtastic_receive, "meshtastic.receive")
-            except:
-                pass
-
-            # 2. 关闭串口连接
-            try:
-                self.interface.close()
-            except:
-                pass
-
-            # 3. 清理资源
-            self.interface = None
-            self.my_node_id = None
-            self.node_list = []
-
-        except Exception as e:
-            logger.error(f"清理资源时出错: {str(e)}")
-            raise
     
     async def start(self):
         """启动 WebSocket 服务器"""
         if not self.init_meshtastic_interface():
-            logger.error("无法初始化 Meshtastic 接口，程序退出")
-            return
-        
-        self.running = True
+            raise RuntimeError("Meshtastic 接口初始化失败")
+            
         self.loop = asyncio.get_running_loop()
+        self.running = True
         
-        # 启动健康检查和消息处理
-        asyncio.create_task(self.health_check())
+        # 启动消息处理循环
         asyncio.create_task(self.process_message_queue())
         
-        # 启动 WebSocket 服务器
         async with serve(self.handle_client, self.host, self.port):
-            logger.info(f"WebSocket 服务器已启动在 {self.host}:{self.port}")
-            await asyncio.Future()  # 运行直到被取消
-
-def main():
-    bridge = None
-    try:
-        # 尝试自动查找串口
-        available_ports = findPorts()
+            logger.info(f"WebSocket 服务器已启动: ws://{self.host}:{self.port}")
+            await self.shutdown_event.wait()
+    
+    async def shutdown(self):
+        """优雅关闭服务器"""
+        logger.info("正在关闭服务器...")
+        self.running = False
         
-        if not available_ports:
-            logger.error("未找到任何 Meshtastic 设备")
-            return
-            
-        if len(available_ports) > 1:
-            logger.warning(f"找到多个设备: {available_ports}")
-            logger.info(f"将使用第一个设备: {available_ports[0]}")
-            
-        serial_port = available_ports[0]
-        logger.info(f"自动选择串口: {serial_port}")
-        
-        bridge = MeshtasticBridge(
-            serial_port=serial_port,
-            host='0.0.0.0',
-            port=5800
-        )
-        
-        asyncio.run(bridge.start())
-    except KeyboardInterrupt:
-        logger.info("程序被用户中断")
-    except Exception as e:
-        logger.error(f"程序异常退出: {str(e)}")
-        logger.exception("详细错误信息：")
-    finally:
-        if bridge and bridge.interface:
+        # 关闭所有客户端连接
+        for client in self.connected_clients:
             try:
-                bridge.interface.close()
-                logger.info("串口已关闭")
+                await client.close(1001, "服务器关闭")
             except:
                 pass
+                
+        # 清理 Meshtastic 接口
+        if self.interface:
+            try:
+                self.interface.close()
+            except:
+                pass
+                
+        self.shutdown_event.set()
+        logger.info("服务器已关闭")
+
+async def main():
+    bridge = MeshtasticBridge()
+    
+    # 注册信号处理
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(bridge.shutdown()))
+    
+    try:
+        await bridge.start()
+    except Exception as e:
+        logger.error(f"服务器启动失败: {str(e)}")
+        await bridge.shutdown()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
