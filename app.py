@@ -242,18 +242,28 @@ class MeshtasticBridge:
                 logger.error(f"处理消息队列时出错: {str(e)}")
     
     async def broadcast_message(self, message: Dict):
-        """广播消息到所有连接的客户端"""
-        with self.lock:
-            disconnected_clients = set()
-            for client in self.connected_clients:
-                try:
-                    await client.send(json.dumps(message))
-                except Exception as e:
-                    logger.error(f"发送消息到socket Client失败: {str(e)}")
-                    disconnected_clients.add(client)
+        """广播消息到所有连接的 WebSocket 客户端"""
+        if not self.connected_clients:
+            return
             
-            # 移除断开的客户端
-            self.connected_clients -= disconnected_clients
+        # 将消息转换为 JSON 字符串
+        try:
+            message_str = json.dumps(message)
+        except Exception as e:
+            logger.error(f"消息序列化失败: {str(e)}")
+            return
+            
+        # 广播到所有连接的客户端
+        disconnected_clients = set()
+        for client in self.connected_clients:
+            try:
+                await client.send(message_str)
+            except Exception as e:
+                logger.error(f"发送到客户端失败: {str(e)}")
+                disconnected_clients.add(client)
+                
+        # 移除断开连接的客户端
+        self.connected_clients -= disconnected_clients
     
     def update_node_list(self):
         """更新Node列表"""
@@ -553,16 +563,42 @@ class MeshtasticBridge:
             port_num = decoded['portnum']
             
             if port_num == 'TEXT_MESSAGE_APP':
-                # 提取消息内容
+                # 提取消息内容和发送者信息
                 try:
                     message = decoded.get('text', '')
+                    from_id = packet.get('fromId', 'unknown')
+                    
+                    # 获取节点信息
+                    node_info = {}
+                    with self.interface_lock:
+                        if self.interface and hasattr(self.interface, 'nodes'):
+                            node_info = self.interface.nodes.get(from_id, {})
+                    
+                    # 构建消息对象
+                    msg_obj = {
+                        'type': 'message',
+                        'fromId': from_id,
+                        'nodeNum': node_info.get('num', 0),
+                        'shortName': node_info.get('user', {}).get('shortName', ''),
+                        'longName': node_info.get('user', {}).get('longName', ''),
+                        'message': message,
+                        'timestamp': time.time() * 1000  # 转换为毫秒
+                    }
+                    
+                    logger.info(f"收到文本消息: {message} (来自Node: {from_id})")
+                    
+                    # 广播消息到所有连接的客户端
+                    asyncio.run_coroutine_threadsafe(
+                        self.broadcast_message(msg_obj),
+                        self.loop
+                    )
                 except Exception as e:
-                    logger.error(f"提取消息内容时出错: {str(e)}")
+                    logger.error(f"处理消息时出错: {str(e)}")
                     return
                 
-                # 获取发送时间戳
+                # 计算传输延迟
                 try:
-                    if 'decoded' in packet and isinstance(packet['decoded'], dict):
+                    if isinstance(message, str):
                         message_data = json.loads(message)
                         if isinstance(message_data, dict) and 'ss' in message_data:
                             send_timestamp = message_data['ss']
@@ -571,25 +607,7 @@ class MeshtasticBridge:
                             time_diff = datetime.fromisoformat(receive_time).timestamp() - datetime.fromisoformat(send_time).timestamp()
                             logger.info(f"传输耗时: {time_diff:.3f} 秒")
                 except Exception as e:
-                    logger.error(f"处理时间戳时出错: {str(e)}")
-                
-                # 获取发送者信息
-                try:
-                    from_id = packet.get('fromId', 'unknown')
-                    logger.info(f"收到文本消息: {message} (来自Node: {from_id})")
-                    
-                    # 广播消息到所有连接的客户端
-                    asyncio.run_coroutine_threadsafe(
-                        self.broadcast_message({
-                            'type': 'message',
-                            'fromId': from_id,
-                            'message': message,
-                            'timestamp': time.time() * 1000  # 转换为毫秒
-                        }),
-                        self.loop
-                    )
-                except Exception as e:
-                    logger.error(f"广播消息时出错: {str(e)}")
+                    logger.error(f"计算传输延迟时出错: {str(e)}")
                 
             elif port_num == 'NODEINFO_APP':
                 # 处理节点信息更新
