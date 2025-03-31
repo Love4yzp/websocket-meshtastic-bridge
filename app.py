@@ -33,7 +33,6 @@ class MeshtasticBridge:
         
         # 消息队列系统
         self.outbound_queue = asyncio.Queue()  # 发送队列
-        self.inbound_queue = asyncio.Queue()   # 接收队列
         
         # 消息跟踪
         self.message_timestamps = {}  # 存储消息发送时间戳
@@ -189,13 +188,12 @@ class MeshtasticBridge:
                         'timestamp': datetime.now().isoformat()
                     }
                 
-                # 将消息放入接收队列 - 不阻塞回调函数
+                # 优化：所有消息都直接广播，完全消除队列延迟
                 asyncio.run_coroutine_threadsafe(
-                    self.inbound_queue.put(msg_obj),
+                    self.broadcast_message(msg_obj),
                     self.loop
                 )
-                
-                logger.info(f"收到文本消息: {message} (来自: {from_id})")
+                logger.info(f"直接广播消息: {message} (来自: {from_id})")
                 
         except Exception as e:
             logger.error(f"处理接收到的消息时出错: {str(e)}")
@@ -284,30 +282,37 @@ class MeshtasticBridge:
             logger.exception("详细错误信息：")
             return False
     
-    async def process_inbound_queue(self):
-        """处理接收队列中的消息"""
-        while self.running:
-            try:
-                message = await self.inbound_queue.get()
-                await self.broadcast_message(message)
-                self.inbound_queue.task_done()
-            except Exception as e:
-                logger.error(f"处理接收队列时出错: {str(e)}")
-                await asyncio.sleep(1)
-    
     async def broadcast_message(self, message: Dict):
         """广播消息到所有连接的客户端"""
         disconnected_clients = set()
         
+        # 优化：使用更高效的广播方式
+        if not self.connected_clients:
+            return
+            
+        # 创建广播任务列表
+        broadcast_tasks = []
         for client in self.connected_clients:
             try:
-                await client.send(json.dumps(message))
+                # 使用 create_task 而不是直接 await，提高并行性
+                task = asyncio.create_task(client.send(json.dumps(message)))
+                broadcast_tasks.append(task)
             except Exception as e:
-                logger.error(f"向客户端发送消息失败: {str(e)}")
+                logger.error(f"创建广播任务失败: {str(e)}")
                 disconnected_clients.add(client)
         
+        # 等待所有广播任务完成
+        if broadcast_tasks:
+            # 使用 gather 并行执行所有任务
+            try:
+                await asyncio.gather(*broadcast_tasks, return_exceptions=True)
+            except Exception as e:
+                logger.error(f"广播消息时出错: {str(e)}")
+        
         # 移除断开的客户端
-        self.connected_clients -= disconnected_clients
+        if disconnected_clients:
+            with self.lock:
+                self.connected_clients -= disconnected_clients
     
     def update_node_list(self):
         """更新节点列表"""
@@ -443,7 +448,10 @@ class MeshtasticBridge:
             try:
                 # 使用 asyncio 避免阻塞
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._close_interface)
+                await loop.run_in_executor(
+                    None,
+                    self._close_interface
+                )
             except Exception as e:
                 logger.error(f"关闭接口时出错: {str(e)}")
 
@@ -483,7 +491,6 @@ class MeshtasticBridge:
         # 启动健康检查和消息处理
         asyncio.create_task(self.health_check())
         asyncio.create_task(self.process_outbound_queue())
-        asyncio.create_task(self.process_inbound_queue())
         
         # 启动 WebSocket 服务器
         async with serve(self.handle_client, self.host, self.port):
