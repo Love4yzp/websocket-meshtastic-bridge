@@ -36,22 +36,29 @@ class MeshtasticBridge:
         self.transmit_lock = asyncio.Lock()  # 添加发送锁，确保半双工通信
         self.outgoing_message_queue = asyncio.Queue()  # 添加发送消息队列
         self.last_transmit_time = 0  # 上次发送消息的时间戳
-        
+        self.consecutive_sends = 0  # 连续发送消息的计数
+        self.last_forced_receive = 0  # 上次强制接收窗口的时间戳
+        self.max_consecutive_sends = 2  # 最大连续发送次数，之后强制接收窗口，从3减少到2
+        self.resource_contention_count = 0  # 资源竞争计数
+        self.interface_lock = threading.RLock()  # 添加接口访问锁，可重入
+        self.receive_window_duration = 6.0  # 接收窗口持续时间（秒），设为6秒以适应空中时间
+        self.min_time_between_sends = 2.0  # 两次发送之间的最小时间间隔（秒）
+
     async def handle_client(self, websocket: WebSocketServerProtocol):
-        """处理单个客户端连接"""
+        """处理单个socket Client连接"""
         try:
             # 等待连接就绪
             try:
                 await asyncio.wait_for(self.connection_ready.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                logger.warning("等待连接就绪超时，但仍将继续处理客户端")
+                logger.warning("等待连接就绪超时，但仍将继续处理socket Client")
                 
             # 添加客户端到连接集合
             with self.lock:
                 self.connected_clients.add(websocket)
-            logger.info(f"新客户端连接，当前连接数: {len(self.connected_clients)}")
+            logger.info(f"新socket Client连接，当前连接数: {len(self.connected_clients)}")
             
-            # 发送初始节点列表
+            # 发送初始Node列表
             await websocket.send(json.dumps({
                 'type': 'node_list',
                 'data': self.node_list
@@ -69,29 +76,29 @@ class MeshtasticBridge:
                         'message': '无效的消息格式'
                     }))
                 except Exception as e:
-                    logger.error(f"处理客户端消息时出错: {str(e)}")
+                    logger.error(f"处理socket Client消息时出错: {str(e)}")
                     await websocket.send(json.dumps({
                         'type': 'error',
                         'message': str(e)
                     }))
                     
         except Exception as e:
-            logger.error(f"处理客户端连接时出错: {str(e)}")
+            logger.error(f"处理socket Client连接时出错: {str(e)}")
         finally:
             # 移除断开的客户端
             with self.lock:
                 self.connected_clients.remove(websocket)
-            logger.info(f"客户端断开连接，当前连接数: {len(self.connected_clients)}")
+            logger.info(f"socket Client断开连接，当前连接数: {len(self.connected_clients)}")
     
     async def handle_client_message(self, data: Dict):
         """处理客户端发送的消息"""
         try:
             logger.info(f"收到客户端消息: {data}")  # 记录收到的完整消息
             
-            # 检查是否是请求节点列表的命令
+            # 检查是否是请求Node列表的命令
             if data.get('type') == 'get_node_list':
-                logger.info("收到获取节点列表请求")
-                # 先更新节点列表
+                logger.info("收到获取Node列表请求")
+                # 先更新Node列表
                 self.update_node_list()
                 # 然后发送给客户端
                 await self.broadcast_message({
@@ -130,8 +137,8 @@ class MeshtasticBridge:
                 'message': str(e)
             })
     
-    def send_to_meshtastic(self, message: str, destination: Optional[str] = None, channel: Optional[int] = None) -> bool:
-        """发送消息到 Meshtastic 网络"""
+    async def send_to_meshtastic(self, message: str, destination: Optional[str] = None, channel: Optional[int] = None) -> bool:
+        """发送消息到 Meshtastic 网络（异步版本）"""
         if not self.interface:
             logger.error("Meshtastic 接口未初始化")
             return False
@@ -139,14 +146,22 @@ class MeshtasticBridge:
         try:
             logger.info(f"准备发送消息: message={message}, destination={destination}, channel={channel}")
             
-            # 验证目标节点是否存在（如果是 DM）
+            # 验证目标Node是否存在（如果是 DM）
             if destination:
                 if not destination.startswith('!'):
-                    logger.error(f"无效的目标节点ID格式: {destination}")
+                    logger.error(f"无效的目标Node ID格式: {destination}")
                     return False
-                if destination not in self.interface.nodes:
-                    logger.error(f"目标节点不存在: {destination}")
-                    return False
+                
+                # 使用锁保护Node访问
+                async with asyncio.Lock():
+                    # 在异步上下文中执行同步操作
+                    has_node = await self.loop.run_in_executor(
+                        None,
+                        lambda: hasattr(self.interface, 'nodes') and destination in self.interface.nodes
+                    )
+                    if not has_node:
+                        logger.error(f"目标Node不存在: {destination}")
+                        return False
             
             # 验证频道号（如果是广播）
             if channel is not None and (channel < 0 or channel > 7):
@@ -156,35 +171,89 @@ class MeshtasticBridge:
             # 记录发送时间
             self.last_transmit_time = time.time()
 
-            if destination:
-                # DM: 使用 nodeId 发送到特定节点
-                logger.info(f"尝试发送 DM 到节点 {destination}")
-                self.interface.sendText(
-                    text=message,
-                    destinationId=destination
-                )
-                logger.info(f"DM 发送成功")
+            # 使用异步锁保护接口访问
+            async with asyncio.Lock():
+                # 在异步上下文中执行同步的发送操作
+                if destination:
+                    # DM: 使用 nodeId 发送到特定Node
+                    logger.info(f"尝试发送 DM 到Node {destination}")
+                    success = await self.loop.run_in_executor(
+                        None,
+                        lambda: self._execute_send(message, destination=destination)
+                    )
+                    if success:
+                        logger.info(f"DM 发送成功")
+                else:
+                    # 广播: 在指定频道发送
+                    channel_idx = channel if channel is not None else 0
+                    success = await self.loop.run_in_executor(
+                        None,
+                        lambda: self._execute_send(message, channel_index=channel_idx)
+                    )
+                    if success:
+                        logger.info(f"广播发送成功")
+                
+                return success
+                
+        except OSError as e:
+            # 处理资源暂时不可用的错误
+            if "Resource temporarily unavailable" in str(e):
+                self.resource_contention_count += 1
+                logger.warning(f"资源暂时不可用 (计数: {self.resource_contention_count}), 将重试")
+                # 如果连续出现多次资源竞争，考虑重置接口
+                if self.resource_contention_count >= 3:
+                    logger.error("连续多次资源竞争，将在下次健康检查中重置接口")
+                    self.connection_ready.clear()  # 标记连接为未就绪
+                return False
             else:
-                # 广播: 在指定频道发送
-                logger.info(f"尝试在频道 {channel} 广播消息")
-                self.interface.sendText(
-                    text=message,
-                    channelIndex=channel if channel is not None else 0
-                )
-                logger.info(f"广播发送成功")
-            return True
+                logger.error(f"发送消息到 Meshtastic 失败: {str(e)}")
+                logger.exception("详细错误信息：")
+                return False
         except Exception as e:
             logger.error(f"发送消息到 Meshtastic 失败: {str(e)}")
             logger.exception("详细错误信息：")
+            return False
+    
+    def _execute_send(self, message: str, destination: Optional[str] = None, channel_index: Optional[int] = None) -> bool:
+        """执行实际的发送操作（同步版本，在线程池中执行）"""
+        try:
+            with self.interface_lock:
+                if destination:
+                    self.interface.sendText(
+                        text=message,
+                        destinationId=destination
+                    )
+                else:
+                    self.interface.sendText(
+                        text=message,
+                        channelIndex=channel_index
+                    )
+            return True
+        except Exception as e:
+            logger.error(f"执行发送操作失败: {str(e)}")
             return False
     
     async def process_outgoing_messages(self):
         """处理发送消息队列，考虑半双工通信的限制"""
         while self.running:
             try:
+                # 检查是否需要强制接收窗口
+                current_time = time.time()
+                if self.consecutive_sends >= self.max_consecutive_sends or (current_time - self.last_forced_receive > 6):  # 减少强制接收窗口的间隔，从10秒改为6秒
+                    logger.info(f"强制接收窗口 (连续发送: {self.consecutive_sends}, 上次接收窗口: {current_time - self.last_forced_receive:.1f}秒前)")
+                    # 强制接收窗口
+                    await self.force_receive_window()
+                    continue
+                
                 # 等待队列中有消息
                 if self.outgoing_message_queue.empty():
-                    await asyncio.sleep(0.5)
+                    # 如果没有消息要发送，每隔一段时间检查一次是否需要强制接收窗口
+                    # 这确保即使在低负载情况下也有足够的接收机会
+                    if current_time - self.last_forced_receive > 3.0:  # 3秒没有接收窗口就创建一个
+                        logger.info("空闲状态下创建接收窗口")
+                        await self.force_receive_window()
+                    else:
+                        await asyncio.sleep(0.5)
                     continue
                 
                 # 检查是否可以发送（连接就绪且获取发送锁）
@@ -194,119 +263,98 @@ class MeshtasticBridge:
                     continue
                 
                 # 获取发送锁（确保半双工通信）
-                async with self.transmit_lock:
-                    # 检查距离上次发送是否有足够的间隔（至少500毫秒）
-                    current_time = time.time()
-                    time_since_last_transmit = current_time - self.last_transmit_time
-                    if time_since_last_transmit < 0.5:  # 500毫秒
-                        await asyncio.sleep(0.5 - time_since_last_transmit)
+                try:
+                    async with self.transmit_lock:
+                        # 检查距离上次发送是否有足够的间隔
+                        current_time = time.time()
+                        time_since_last_transmit = current_time - self.last_transmit_time
+                        if time_since_last_transmit < self.min_time_between_sends:
+                            await asyncio.sleep(self.min_time_between_sends - time_since_last_transmit)
+                        
+                        # 从队列获取消息
+                        message_data = await self.outgoing_message_queue.get()
+                        
+                        # 发送消息（现在是异步的）
+                        success = await self.send_to_meshtastic(
+                            message=message_data['message'],
+                            destination=message_data.get('destination'),
+                            channel=message_data.get('channel')
+                        )
+                        
+                        if success:
+                            # 更新连续发送计数
+                            self.consecutive_sends += 1
+                            self.resource_contention_count = 0  # 重置资源竞争计数
+                            
+                            # 通知客户端发送结果
+                            await self.broadcast_message({
+                                'type': 'success',
+                                'message': '消息发送成功'
+                            })
+                            
+                            # 发送后立即创建一个短接收窗口，以捕获快速响应
+                            # 这对于捕获对刚发送消息的响应很重要
+                            logger.info("发送后创建短接收窗口")
+                            # 释放发送锁，以便其他操作可以进行
+                        else:
+                            # 如果是资源竞争，重新入队消息
+                            if self.resource_contention_count > 0:
+                                logger.info("由于资源竞争，消息将重新入队")
+                                # 将消息放回队列前端
+                                temp_queue = asyncio.Queue()
+                                await temp_queue.put(message_data)
+                                while not self.outgoing_message_queue.empty():
+                                    item = await self.outgoing_message_queue.get()
+                                    await temp_queue.put(item)
+                                self.outgoing_message_queue = temp_queue
+                                
+                                # 等待更长时间后重试
+                                await asyncio.sleep(2.0)
+                            else:
+                                await self.broadcast_message({
+                                    'type': 'error',
+                                    'message': '发送消息失败'
+                                })
+                        
+                        # 发送后等待一小段时间，让设备有时间切换到接收模式
+                        # 增加等待时间，确保有足够的时间接收回传
+                        await asyncio.sleep(2.0)  # 从1秒增加到2秒
                     
-                    # 从队列获取消息
-                    message_data = await self.outgoing_message_queue.get()
-                    
-                    # 发送消息
-                    success = self.send_to_meshtastic(
-                        message=message_data['message'],
-                        destination=message_data.get('destination'),
-                        channel=message_data.get('channel')
-                    )
-                    
-                    # 通知客户端发送结果
-                    if success:
-                        await self.broadcast_message({
-                            'type': 'success',
-                            'message': '消息发送成功'
-                        })
-                    else:
-                        await self.broadcast_message({
-                            'type': 'error',
-                            'message': '发送消息失败'
-                        })
-                    
-                    # 发送后等待一小段时间，让设备有时间切换到接收模式
-                    await asyncio.sleep(0.5)
+                    # 在发送锁释放后，创建一个接收窗口来捕获响应
+                    # 这是在发送锁外部进行的，因此不会阻塞其他发送操作
+                    if success and self.consecutive_sends > 0:
+                        # 创建一个短接收窗口，但不获取发送锁
+                        # 这允许我们在等待响应的同时处理其他操作
+                        logger.info("发送后等待回传响应")
+                        # 等待3-6秒的空中时间
+                        await asyncio.sleep(4.0)  # 等待足够长的时间以接收回传
+                
+                except Exception as e:
+                    logger.error(f"处理消息时出错: {str(e)}")
+                    await asyncio.sleep(1)
             
             except Exception as e:
                 logger.error(f"处理发送消息队列时出错: {str(e)}")
                 await asyncio.sleep(1)  # 出错后暂停一下
     
-    def on_meshtastic_receive(self, packet: Dict, interface: SerialInterface):
-        """处理从 Meshtastic 接收到的消息（同步版本）"""
+    async def force_receive_window(self):
+        """强制创建一个接收窗口，暂停发送"""
         try:
-            # 确保接收时不发送（半双工通信）
-            asyncio.run_coroutine_threadsafe(self._acquire_transmit_lock_temporarily(), self.loop)
-            
-            # 检查包是否为空
-            if not packet or 'decoded' not in packet:
-                logger.warning("收到空包或无法解码的包")
-                return
-                
-            port_num = packet['decoded'].get('portnum')
-            if not port_num:
-                logger.warning("包中没有端口号")
-                return
-            
-            # 只处理我们关心的消息类型
-            if port_num == 'TEXT_MESSAGE_APP':
-                # 确保payload存在且可解码
-                if 'payload' not in packet['decoded']:
-                    logger.warning("文本消息中没有payload")
-                    return
-                    
-                try:
-                    message = packet['decoded']['payload'].decode('utf-8')
-                except Exception as e:
-                    logger.error(f"解码消息失败: {str(e)}")
-                    return
-                    
-                from_id = packet.get('fromId')
-                if not from_id:
-                    logger.warning("消息中没有发送者ID")
-                    from_id = "unknown"
-                    
-                # 安全获取节点信息
-                node_info = {}
-                if self.interface and hasattr(self.interface, 'nodes'):
-                    node_info = self.interface.nodes.get(from_id, {})
-                
-                msg_obj = {
-                    'type': 'text',
-                    'fromId': from_id,
-                    'nodeNum': node_info.get('num', 0),
-                    'shortName': node_info.get('user', {}).get('shortName', ''),
-                    'longName': node_info.get('user', {}).get('longName', ''),
-                    'channel': packet.get('channel', 0),
-                    'message': message,
-                    'timestamp': datetime.now().isoformat()
-                }
-                
-                # 转发到 WebSocket
-                asyncio.run_coroutine_threadsafe(self.message_queue.put(msg_obj), self.loop)
-                logger.info(f"收到文本消息: {message} (来自: {from_id})")
-                
-            elif port_num == 'NODEINFO_APP':
-                # 处理节点信息更新
-                logger.info("收到节点信息更新")
-                self.update_node_list()
-                
-            elif port_num == 'POSITION_APP':
-                # 如果需要处理位置信息，可以在这里添加
-                pass
-            else:
-                # 对于其他类型的消息，只记录日志但不转发
-                logger.debug(f"收到未处理的消息类型: {port_num}")
-                
-        except Exception as e:
-            logger.error(f"处理 Meshtastic 消息时出错: {str(e)}")
-    
-    async def _acquire_transmit_lock_temporarily(self):
-        """临时获取发送锁，用于接收消息时阻止发送"""
-        try:
+            logger.info("开始强制接收窗口")
             async with self.transmit_lock:
-                # 持有锁一小段时间，确保接收过程中不会发送
-                await asyncio.sleep(0.2)
+                # 重置计数器
+                self.consecutive_sends = 0
+                self.last_forced_receive = time.time()
+                
+                # 等待一段时间，让设备有机会接收消息
+                # 这段时间内，由于持有发送锁，不会发送任何消息
+                # 增加到6秒，以适应LoRa的空中时间
+                logger.info(f"接收窗口将持续 {self.receive_window_duration} 秒")
+                await asyncio.sleep(self.receive_window_duration)  # 从3秒增加到6秒接收窗口
+                
+            logger.info("强制接收窗口结束")
         except Exception as e:
-            logger.error(f"获取发送锁时出错: {str(e)}")
+            logger.error(f"强制接收窗口时出错: {str(e)}")
     
     async def process_message_queue(self):
         """处理消息队列中的消息"""
@@ -325,14 +373,14 @@ class MeshtasticBridge:
                 try:
                     await client.send(json.dumps(message))
                 except Exception as e:
-                    logger.error(f"发送消息到客户端失败: {str(e)}")
+                    logger.error(f"发送消息到socket Client失败: {str(e)}")
                     disconnected_clients.add(client)
             
             # 移除断开的客户端
             self.connected_clients -= disconnected_clients
     
     def update_node_list(self):
-        """更新节点列表"""
+        """更新Node列表"""
         try:
             if self.interface and hasattr(self.interface, 'nodes'):
                 node_info = self.interface.nodes
@@ -366,11 +414,11 @@ class MeshtasticBridge:
                         }
                         for node_id, node in node_info.items()
                     ]
-                    logger.info(f"节点列表已更新，共 {len(self.node_list)} 个节点")
+                    logger.info(f"Node列表已更新，共 {len(self.node_list)} 个Node")
                 else:
-                    logger.warning("节点信息为空，无法更新节点列表")
+                    logger.warning("Node信息为空，无法更新Node列表")
         except Exception as e:
-            logger.error(f"更新节点列表失败: {str(e)}")
+            logger.error(f"更新Node列表失败: {str(e)}")
     
     def init_meshtastic_interface(self) -> bool:
         """初始化 Meshtastic 接口"""
@@ -380,22 +428,46 @@ class MeshtasticBridge:
             # 确保之前的接口已关闭
             if self.interface:
                 try:
-                    self.interface.close()
+                    with self.interface_lock:
+                        self.interface.close()
                 except:
                     pass
                 self.interface = None
             
-            # 重置连接就绪状态
+            # 重置连接就绪状态和计数器
             self.connection_ready.clear()
+            self.resource_contention_count = 0
+            self.consecutive_sends = 0
             
-            logger.info("尝试创建 SerialInterface 实例...")
-            self.interface = SerialInterface(self.serial_port)
-            logger.info("SerialInterface 实例创建成功")
+            # 尝试多次初始化接口
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    logger.info(f"尝试创建 SerialInterface 实例 (尝试 {attempt}/{max_attempts})...")
+                    
+                    # 在创建接口前等待一段时间，确保串口资源已释放
+                    if attempt > 1:
+                        time.sleep(2)
+                    
+                    self.interface = SerialInterface(self.serial_port)
+                    logger.info("SerialInterface 实例创建成功")
+                    break
+                except OSError as e:
+                    if "Resource temporarily unavailable" in str(e) and attempt < max_attempts:
+                        logger.warning(f"资源暂时不可用，将重试 ({attempt}/{max_attempts})")
+                        time.sleep(2)  # 等待资源释放
+                    else:
+                        raise
+            
+            if not self.interface:
+                logger.error("所有初始化尝试都失败")
+                return False
             
             # 获取当前节点ID - 使用多种备选方案
             logger.info("正在获取节点信息...")
             try:
-                node_info = self.interface.getMyNodeInfo()
+                with self.interface_lock:
+                    node_info = self.interface.getMyNodeInfo()
                 # 尝试多种方式获取节点ID
                 if node_info:
                     # 方法1: 直接从 nodeId 字段获取
@@ -419,10 +491,10 @@ class MeshtasticBridge:
                 logger.error(f"获取节点ID失败: {str(e)}")
                 self.my_node_id = "!local"  # 使用默认值
             
-            # 更新节点列表
-            logger.info("正在更新节点列表...")
+            # 更新Node列表
+            logger.info("正在更新Node列表...")
             self.update_node_list()
-            logger.info("节点列表更新完成")
+            logger.info("Node列表更新完成")
             
             # 订阅消息接收回调
             logger.info("正在订阅消息接收事件...")
@@ -432,6 +504,7 @@ class MeshtasticBridge:
             # 标记连接就绪
             self.connection_ready.set()
             self.last_successful_check = time.time()
+            self.last_forced_receive = time.time()  # 初始化最后强制接收窗口时间
             
             return True
         except Exception as e:
@@ -471,12 +544,17 @@ class MeshtasticBridge:
                             await self._notify_connection_status(False)
                             self.interface = None
                 
+                # 每次健康检查后，强制一个接收窗口
+                # 这确保即使在高负载下，也有机会接收消息
+                if self.interface and self.connection_ready.is_set():
+                    await self.force_receive_window()
+                
             except Exception as e:
                 logger.error(f"健康检查出错: {str(e)}")
                 logger.exception("详细错误信息：")
             
             # 减少健康检查间隔，提高响应速度
-            await asyncio.sleep(10)  # 从30秒改为10秒检查一次
+            await asyncio.sleep(30)  # 健康检查间隔保持在30秒
     
     async def _notify_connection_status(self, is_connected: bool):
         """通知所有客户端连接状态"""
@@ -495,18 +573,33 @@ class MeshtasticBridge:
             if not self.interface:
                 return False
 
+            # 如果资源竞争计数过高，认为连接不健康
+            if self.resource_contention_count >= 3:
+                logger.warning(f"资源竞争计数过高 ({self.resource_contention_count})，认为连接不健康")
+                return False
+
             # 尝试发送一个简单的请求（使用 asyncio 避免阻塞）
             loop = asyncio.get_running_loop()
             try:
-                # 设置超时时间为 2 秒（从3秒减少）
+                # 设置超时时间为 2 秒
                 await asyncio.wait_for(
                     loop.run_in_executor(None, self._check_node_info),
                     timeout=2.0
                 )
+                # 成功检查后重置资源竞争计数
+                self.resource_contention_count = 0
                 return True
             except asyncio.TimeoutError:
                 logger.warning("获取节点信息超时")
                 return False
+            except OSError as e:
+                if "Resource temporarily unavailable" in str(e):
+                    self.resource_contention_count += 1
+                    logger.warning(f"健康检查时资源暂时不可用 (计数: {self.resource_contention_count})")
+                    return False
+                else:
+                    logger.warning(f"获取节点信息失败: {str(e)}")
+                    return False
             except Exception as e:
                 logger.warning(f"获取节点信息失败: {str(e)}")
                 return False
@@ -514,12 +607,13 @@ class MeshtasticBridge:
         except Exception as e:
             logger.error(f"健康检查过程出错: {str(e)}")
             return False
-
+    
     def _check_node_info(self):
         """检查节点信息（在执行器中运行）"""
         try:
             # 尝试获取节点信息来验证连接
-            node_info = self.interface.getMyNodeInfo()
+            with self.interface_lock:
+                node_info = self.interface.getMyNodeInfo()
             if not node_info:
                 raise Exception("无法获取节点信息")
             return True
@@ -548,7 +642,8 @@ class MeshtasticBridge:
 
             # 2. 关闭串口连接
             try:
-                self.interface.close()
+                with self.interface_lock:
+                    self.interface.close()
             except:
                 pass
 
