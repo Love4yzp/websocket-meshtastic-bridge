@@ -288,56 +288,53 @@ class MeshtasticBridge:
     
     def init_meshtastic_interface(self) -> bool:
         """初始化 Meshtastic 接口"""
-        for attempt in range(settings.RECONNECT_ATTEMPTS):
-            try:
-                logger.info(f"正在初始化 Meshtastic 接口，串口: {self.serial_port} (尝试 {attempt + 1}/{settings.RECONNECT_ATTEMPTS})")
-                
-                if self.serial_port is None:
-                    ports = findPorts()
-                    if not ports:
-                        raise ValueError("未找到 Meshtastic 设备")
-                    self.serial_port = ports[0]
-                    logger.info(f"自动选择串口: {self.serial_port}")
-                
-                self.interface = SerialInterface(self.serial_port)
-                
-                # 等待接口初始化完成
-                retry = 0
-                while not self.interface.nodes and retry < 10:
-                    logger.info("等待节点信息初始化...")
-                    time.sleep(1)
-                    retry += 1
-                
-                if not self.interface.nodes:
-                    raise ValueError("节点信息初始化超时")
-                
-                self.my_node_id = self.interface.getMyNodeInfo().get('nodeId', None)
-                if not self.my_node_id:
-                    raise ValueError("无法获取本机节点ID")
-                    
-                logger.info(f"当前节点ID: {self.my_node_id}")
-                
-                self.update_node_list()
-                pub.subscribe(self.on_meshtastic_receive, "meshtastic.receive")
-                logger.info("Meshtastic 接口初始化成功")
-                
-                return True
-                
-            except Exception as e:
-                logger.error(f"初始化失败: {str(e)}")
-                if self.interface:
-                    try:
-                        self.interface.close()
-                    except:
-                        pass
-                    self.interface = None
-                    
-                if attempt < settings.RECONNECT_ATTEMPTS - 1:
-                    logger.info(f"等待 {settings.RECONNECT_DELAY} 秒后重试...")
-                    time.sleep(settings.RECONNECT_DELAY)
-                else:
-                    logger.error("已达到最大重试次数，初始化失败")
+        try:
+            logger.info("正在初始化 Meshtastic 接口...")
+            
+            # 尝试自动发现设备
+            if self.serial_port is None:
+                ports = findPorts()
+                if not ports:
+                    logger.error("未找到 Meshtastic 设备")
                     return False
+                self.serial_port = ports[0]
+                logger.info(f"自动选择串口: {self.serial_port}")
+            
+            # 创建接口连接
+            self.interface = SerialInterface(self.serial_port)
+            
+            # 获取节点信息
+            node_info = self.interface.getMyNodeInfo()
+            if not node_info:
+                logger.error("无法获取节点信息")
+                return False
+                
+            self.my_node_id = node_info.get('nodeId')
+            if not self.my_node_id:
+                logger.error("无法获取本机节点ID")
+                return False
+                
+            logger.info(f"当前节点ID: {self.my_node_id}")
+            logger.info(f"节点信息: {self.interface.showInfo()}")
+            
+            # 更新节点列表
+            self.update_node_list()
+            
+            # 订阅消息
+            pub.subscribe(self.on_meshtastic_receive, "meshtastic.receive")
+            logger.info("Meshtastic 接口初始化成功")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"初始化失败: {str(e)}")
+            if self.interface:
+                try:
+                    self.interface.close()
+                except:
+                    pass
+                self.interface = None
+            return False
 
     async def process_message_queue(self):
         """处理消息队列中的消息"""

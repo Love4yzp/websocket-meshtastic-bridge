@@ -1,4 +1,4 @@
-meshtastic==2.5.12
+meshtastic==2.6.0
 websockets==12.0
 pypubsub==4.0.3
 pydantic==2.6.1
