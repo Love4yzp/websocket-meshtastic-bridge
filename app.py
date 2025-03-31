@@ -4,7 +4,9 @@ import logging
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any, Deque
+from collections import deque
+import uuid
 from websockets.server import serve, WebSocketServerProtocol
 from meshtastic.serial_interface import SerialInterface
 from meshtastic import portnums_pb2
@@ -28,14 +30,28 @@ class MeshtasticBridge:
         self.connected_clients: Set[WebSocketServerProtocol] = set()
         self.running = False
         self.lock = threading.Lock()
-        self.message_queue = asyncio.Queue()
+        
+        # 消息队列系统
+        self.outbound_queue = asyncio.Queue()  # 发送队列
+        self.inbound_queue = asyncio.Queue()   # 接收队列
+        
+        # 半双工通信管理
+        self.is_receiving = False  # 标记是否正在接收消息
+        self.is_transmitting = False  # 标记是否正在发送消息
+        self.transmit_lock = asyncio.Lock()  # 发送锁
+        self.last_tx_time = 0  # 上次发送时间
+        self.tx_cooldown = 0.5  # 发送冷却时间（秒）
+        
+        # 消息跟踪
+        self.pending_messages = {}  # 待确认的消息
+        self.message_history = deque(maxlen=100)  # 消息历史记录
+        
         self.loop = None
-        self.my_node_id = None  # 添加当前节点ID
+        self.my_node_id = None
         
     async def handle_client(self, websocket: WebSocketServerProtocol):
         """处理单个客户端连接"""
         try:
-            # 添加客户端到连接集合
             with self.lock:
                 self.connected_clients.add(websocket)
             logger.info(f"新客户端连接，当前连接数: {len(self.connected_clients)}")
@@ -46,11 +62,10 @@ class MeshtasticBridge:
                 'data': self.node_list
             }))
             
-            # 处理客户端消息
             async for message in websocket:
                 try:
                     data = json.loads(message)
-                    await self.handle_client_message(data)
+                    await self.handle_client_message(data, websocket)
                 except json.JSONDecodeError:
                     logger.error("收到无效的 JSON 消息")
                     await websocket.send(json.dumps({
@@ -63,20 +78,16 @@ class MeshtasticBridge:
                         'type': 'error',
                         'message': str(e)
                     }))
-                    
         except Exception as e:
             logger.error(f"处理客户端连接时出错: {str(e)}")
         finally:
-            # 移除断开的客户端
             with self.lock:
                 self.connected_clients.remove(websocket)
             logger.info(f"客户端断开连接，当前连接数: {len(self.connected_clients)}")
     
-    async def handle_client_message(self, data: Dict):
+    async def handle_client_message(self, data: Dict, websocket: WebSocketServerProtocol):
         """处理客户端发送的消息"""
         try:
-            logger.info(f"收到客户端消息: {data}")  # 记录收到的完整消息
-            
             message = data.get('message', '')
             destination = data.get('destination')
             channel = data.get('channel', 0)
@@ -84,30 +95,117 @@ class MeshtasticBridge:
             if not message:
                 raise ValueError("消息内容不能为空")
             
-            logger.info(f"正在处理消息: message={message}, destination={destination}, channel={channel}")
+            # 生成消息ID用于跟踪
+            message_id = str(uuid.uuid4())
             
-            success = self.send_to_meshtastic(
-                message=message,
-                destination=destination,
-                channel=channel
-            )
-            if not success:
-                raise Exception("发送消息失败")
-                
+            # 创建消息对象
+            message_obj = {
+                'id': message_id,
+                'text': message,
+                'destination': destination,
+                'channel': channel,
+                'timestamp': time.time(),
+                'retries': 0,
+                'max_retries': 3,
+                'status': 'queued',
+                'source_client': websocket
+            }
+            
+            # 将消息添加到待处理队列
+            self.pending_messages[message_id] = message_obj
+            await self.outbound_queue.put(message_obj)
+            
+            # 通知客户端消息已加入队列
+            await websocket.send(json.dumps({
+                'type': 'message_status',
+                'message_id': message_id,
+                'status': 'queued',
+                'timestamp': datetime.now().isoformat()
+            }))
+            
         except Exception as e:
             logger.error(f"处理客户端消息时出错: {str(e)}")
-            logger.exception("详细错误信息：")
-            raise
+            await websocket.send(json.dumps({
+                'type': 'error',
+                'message': str(e)
+            }))
     
-    def send_to_meshtastic(self, message: str, destination: Optional[str] = None, channel: Optional[int] = None) -> bool:
-        """发送消息到 Meshtastic 网络"""
+    async def process_outbound_queue(self):
+        """处理发送队列中的消息"""
+        while self.running:
+            try:
+                # 如果正在接收消息，等待
+                if self.is_receiving:
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # 获取下一条要发送的消息
+                message_obj = await self.outbound_queue.get()
+                message_id = message_obj['id']
+                
+                # 检查消息是否仍然有效
+                if message_id not in self.pending_messages:
+                    self.outbound_queue.task_done()
+                    continue
+                
+                # 获取发送锁
+                async with self.transmit_lock:
+                    # 检查距离上次发送是否有足够的冷却时间
+                    current_time = time.time()
+                    time_since_last_tx = current_time - self.last_tx_time
+                    if time_since_last_tx < self.tx_cooldown:
+                        await asyncio.sleep(self.tx_cooldown - time_since_last_tx)
+                    
+                    # 标记正在发送
+                    self.is_transmitting = True
+                    
+                    try:
+                        success = await self._send_message_to_meshtastic(
+                            message=message_obj['text'],
+                            destination=message_obj['destination'],
+                            channel=message_obj['channel']
+                        )
+                        
+                        if success:
+                            logger.info(f"消息 {message_id} 发送成功")
+                            message_obj['status'] = 'sent'
+                            
+                            # 如果是广播消息，直接标记为完成
+                            if message_obj['destination'] is None:
+                                message_obj['status'] = 'completed'
+                                if message_id in self.pending_messages:
+                                    del self.pending_messages[message_id]
+                                self.message_history.append(message_obj)
+                        else:
+                            logger.warning(f"消息 {message_id} 发送失败")
+                            message_obj['retries'] += 1
+                            if message_obj['retries'] < message_obj['max_retries']:
+                                await self.outbound_queue.put(message_obj)
+                            else:
+                                message_obj['status'] = 'failed'
+                                if message_id in self.pending_messages:
+                                    del self.pending_messages[message_id]
+                                self.message_history.append(message_obj)
+                        
+                        # 更新发送时间
+                        self.last_tx_time = time.time()
+                        
+                    finally:
+                        self.is_transmitting = False
+                
+                self.outbound_queue.task_done()
+                
+            except Exception as e:
+                logger.error(f"处理发送队列时出错: {str(e)}")
+                await asyncio.sleep(1)
+    
+    async def _send_message_to_meshtastic(self, message: str, destination: Optional[str] = None, channel: Optional[int] = None) -> bool:
+        """异步发送消息到 Meshtastic 网络"""
         if not self.interface:
             logger.error("Meshtastic 接口未初始化")
             return False
             
         try:
-            logger.info(f"准备发送消息: message={message}, destination={destination}, channel={channel}")
-            
             # 验证目标节点是否存在（如果是 DM）
             if destination:
                 if not destination.startswith('!'):
@@ -122,22 +220,26 @@ class MeshtasticBridge:
                 logger.error(f"无效的频道号: {channel}")
                 return False
 
+            # 使用 asyncio 执行器运行同步的 sendText 方法
+            loop = asyncio.get_running_loop()
             if destination:
                 # DM: 使用 nodeId 发送到特定节点
-                logger.info(f"尝试发送 DM 到节点 {destination}")
-                self.interface.sendText(
-                    text=message,
-                    destinationId=destination
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.interface.sendText(
+                        text=message,
+                        destinationId=destination
+                    )
                 )
-                logger.info(f"DM 发送成功")
             else:
                 # 广播: 在指定频道发送
-                logger.info(f"尝试在频道 {channel} 广播消息")
-                self.interface.sendText(
-                    text=message,
-                    channelIndex=channel if channel is not None else 0
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.interface.sendText(
+                        text=message,
+                        channelIndex=channel if channel is not None else 0
+                    )
                 )
-                logger.info(f"广播发送成功")
             return True
         except Exception as e:
             logger.error(f"发送消息到 Meshtastic 失败: {str(e)}")
@@ -145,78 +247,71 @@ class MeshtasticBridge:
             return False
     
     def on_meshtastic_receive(self, packet: Dict, interface: SerialInterface):
-        """处理从 Meshtastic 接收到的消息（同步版本）"""
+        """处理从 Meshtastic 接收到的消息"""
         try:
-            port_num = packet['decoded']['portnum']
+            # 标记正在接收消息
+            self.is_receiving = True
             
-            # 只处理我们关心的消息类型
-            if port_num == 'TEXT_MESSAGE_APP':
-                message = packet['decoded']['payload'].decode('utf-8')
-                from_id = packet['fromId']
-                node_info = self.interface.nodes.get(from_id, {})
+            try:
+                port_num = packet['decoded']['portnum']
                 
-                msg_obj = {
-                    'type': 'text',
-                    'fromId': from_id,
-                    'nodeNum': node_info.get('num', 0),
-                    'shortName': node_info.get('user', {}).get('shortName', ''),
-                    'longName': node_info.get('user', {}).get('longName', ''),
-                    'channel': packet.get('channel', 0),
-                    'message': message,
-                    'timestamp': datetime.now().isoformat()
-                }
+                # 只处理文本消息
+                if port_num == 'TEXT_MESSAGE_APP':
+                    message = packet['decoded']['payload'].decode('utf-8')
+                    from_id = packet['fromId']
+                    node_info = self.interface.nodes.get(from_id, {})
+                    
+                    msg_obj = {
+                        'type': 'text',
+                        'fromId': from_id,
+                        'nodeNum': node_info.get('num', 0),
+                        'shortName': node_info.get('user', {}).get('shortName', 'Unknown'),
+                        'longName': node_info.get('user', {}).get('longName', ''),
+                        'channel': packet.get('channel', 0),
+                        'message': message,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    # 将消息放入接收队列
+                    asyncio.run_coroutine_threadsafe(
+                        self.inbound_queue.put(msg_obj),
+                        self.loop
+                    )
+                    
+                    logger.info(f"收到文本消息: {message} (来自: {from_id})")
+                    
+            except Exception as e:
+                logger.error(f"处理接收到的消息时出错: {str(e)}")
+                logger.exception("详细错误信息：")
                 
-                # 转发到 WebSocket
-                asyncio.run_coroutine_threadsafe(self.message_queue.put(msg_obj), self.loop)
-                logger.info(f"收到文本消息: {message} (来自: {from_id})")
-                
-            elif port_num == 'POSITION_APP':
-                # 如果需要处理位置信息，可以在这里添加
-                pass
-            else:
-                # 对于其他类型的消息，只记录日志但不转发
-                logger.debug(f"收到未处理的消息类型: {port_num}")
-                
-        except Exception as e:
-            logger.error(f"处理 Meshtastic 消息时出错: {str(e)}")
-
-    def _get_message_type(self, port_num: str) -> str:
-        """根据端口号获取消息类型"""
-        type_mapping = {
-            'TEXT_MESSAGE_APP': 'text',
-            'POSITION_APP': 'position',
-            'NODEINFO_APP': 'nodeinfo',
-            'ROUTING_APP': 'routing',
-            'ADMIN_APP': 'admin',
-            'TELEMETRY_APP': 'telemetry',
-            'REMOTEHARD_APP': 'remote',
-            'SIMULATOR_APP': 'simulator'
-            # 可以根据需要添加更多类型
-        }
-        return type_mapping.get(port_num, 'unknown')
+        finally:
+            # 确保重置接收状态
+            self.is_receiving = False
     
-    async def process_message_queue(self):
-        """处理消息队列中的消息"""
+    async def process_inbound_queue(self):
+        """处理接收队列中的消息"""
         while self.running:
             try:
-                message = await self.message_queue.get()
+                message = await self.inbound_queue.get()
                 await self.broadcast_message(message)
+                self.inbound_queue.task_done()
             except Exception as e:
-                logger.error(f"处理消息队列时出错: {str(e)}")
+                logger.error(f"处理接收队列时出错: {str(e)}")
+                await asyncio.sleep(1)
     
     async def broadcast_message(self, message: Dict):
         """广播消息到所有连接的客户端"""
-        with self.lock:
-            disconnected_clients = set()
-            for client in self.connected_clients:
-                try:
-                    await client.send(json.dumps(message))
-                except Exception as e:
-                    logger.error(f"发送消息到客户端失败: {str(e)}")
-                    disconnected_clients.add(client)
-            
-            # 移除断开的客户端
-            self.connected_clients -= disconnected_clients
+        disconnected_clients = set()
+        
+        for client in self.connected_clients:
+            try:
+                await client.send(json.dumps(message))
+            except Exception as e:
+                logger.error(f"向客户端发送消息失败: {str(e)}")
+                disconnected_clients.add(client)
+        
+        # 移除断开的客户端
+        self.connected_clients -= disconnected_clients
     
     def update_node_list(self):
         """更新节点列表"""
@@ -391,7 +486,8 @@ class MeshtasticBridge:
         
         # 启动健康检查和消息处理
         asyncio.create_task(self.health_check())
-        asyncio.create_task(self.process_message_queue())
+        asyncio.create_task(self.process_outbound_queue())
+        asyncio.create_task(self.process_inbound_queue())
         
         # 启动 WebSocket 服务器
         async with serve(self.handle_client, self.host, self.port):
