@@ -237,20 +237,19 @@ class MeshtasticBridge:
         """处理发送消息队列，考虑半双工通信的限制"""
         while self.running:
             try:
-                # 检查是否需要强制接收窗口
+                # 检查是否需要强制接收窗口 - 只在有发送活动后才考虑
                 current_time = time.time()
-                if self.consecutive_sends >= self.max_consecutive_sends or (current_time - self.last_forced_receive > 6):  # 减少强制接收窗口的间隔，从10秒改为6秒
-                    logger.info(f"强制接收窗口 (连续发送: {self.consecutive_sends}, 上次接收窗口: {current_time - self.last_forced_receive:.1f}秒前)")
+                if self.consecutive_sends > 0 and (self.consecutive_sends >= self.max_consecutive_sends or (current_time - self.last_forced_receive > 6)):
+                    logger.debug(f"强制接收窗口 (连续发送: {self.consecutive_sends}, 上次接收窗口: {current_time - self.last_forced_receive:.1f}秒前)")
                     # 强制接收窗口
                     await self.force_receive_window()
                     continue
                 
                 # 等待队列中有消息
                 if self.outgoing_message_queue.empty():
-                    # 如果没有消息要发送，每隔一段时间检查一次是否需要强制接收窗口
-                    # 这确保即使在低负载情况下也有足够的接收机会
-                    if current_time - self.last_forced_receive > 3.0:  # 3秒没有接收窗口就创建一个
-                        logger.info("空闲状态下创建接收窗口")
+                    # 如果没有消息要发送，不要创建不必要的接收窗口，除非有发送活动
+                    if self.consecutive_sends > 0 and current_time - self.last_forced_receive > 6.0:
+                        # 只有在有过发送活动且超过6秒没有接收窗口时才创建
                         await self.force_receive_window()
                     else:
                         await asyncio.sleep(0.5)
@@ -292,10 +291,9 @@ class MeshtasticBridge:
                                 'message': '消息发送成功'
                             })
                             
-                            # 发送后立即创建一个短接收窗口，以捕获快速响应
-                            # 这对于捕获对刚发送消息的响应很重要
-                            logger.info("发送后创建短接收窗口")
-                            # 释放发送锁，以便其他操作可以进行
+                            # 发送后不要立即创建短接收窗口，除非是最后一条消息
+                            if self.consecutive_sends >= self.max_consecutive_sends:
+                                logger.debug("达到最大连续发送次数，准备接收回传")
                         else:
                             # 如果是资源竞争，重新入队消息
                             if self.resource_contention_count > 0:
@@ -320,12 +318,11 @@ class MeshtasticBridge:
                         # 增加等待时间，确保有足够的时间接收回传
                         await asyncio.sleep(2.0)  # 从1秒增加到2秒
                     
-                    # 在发送锁释放后，创建一个接收窗口来捕获响应
-                    # 这是在发送锁外部进行的，因此不会阻塞其他发送操作
-                    if success and self.consecutive_sends > 0:
-                        # 创建一个短接收窗口，但不获取发送锁
-                        # 这允许我们在等待响应的同时处理其他操作
-                        logger.info("发送后等待回传响应")
+                    # 在发送锁释放后，只有在队列为空时才等待回传
+                    # 这样可以避免不必要的等待，提高吞吐量
+                    if success and self.consecutive_sends > 0 and self.outgoing_message_queue.empty():
+                        # 只有在队列为空时才等待回传，避免不必要的延迟
+                        logger.debug("队列为空，等待回传响应")
                         # 等待3-6秒的空中时间
                         await asyncio.sleep(4.0)  # 等待足够长的时间以接收回传
                 
@@ -340,7 +337,7 @@ class MeshtasticBridge:
     async def force_receive_window(self):
         """强制创建一个接收窗口，暂停发送"""
         try:
-            logger.info("开始强制接收窗口")
+            logger.debug("开始强制接收窗口")
             async with self.transmit_lock:
                 # 重置计数器
                 self.consecutive_sends = 0
@@ -349,10 +346,9 @@ class MeshtasticBridge:
                 # 等待一段时间，让设备有机会接收消息
                 # 这段时间内，由于持有发送锁，不会发送任何消息
                 # 增加到6秒，以适应LoRa的空中时间
-                logger.info(f"接收窗口将持续 {self.receive_window_duration} 秒")
                 await asyncio.sleep(self.receive_window_duration)  # 从3秒增加到6秒接收窗口
                 
-            logger.info("强制接收窗口结束")
+            logger.debug("强制接收窗口结束")
         except Exception as e:
             logger.error(f"强制接收窗口时出错: {str(e)}")
     
@@ -544,9 +540,10 @@ class MeshtasticBridge:
                             await self._notify_connection_status(False)
                             self.interface = None
                 
-                # 每次健康检查后，强制一个接收窗口
-                # 这确保即使在高负载下，也有机会接收消息
-                if self.interface and self.connection_ready.is_set():
+                # 健康检查后，只有在有发送活动时才考虑创建接收窗口
+                # 这避免了不必要的接收窗口
+                if self.interface and self.connection_ready.is_set() and self.consecutive_sends > 0:
+                    # 只有在有发送活动时才创建接收窗口
                     await self.force_receive_window()
                 
             except Exception as e:
@@ -676,6 +673,88 @@ class MeshtasticBridge:
         async with serve(self.handle_client, self.host, self.port):
             logger.info(f"WebSocket 服务器已启动在 {self.host}:{self.port}")
             await asyncio.Future()  # 运行直到被取消
+
+    def on_meshtastic_receive(self, packet: Dict, interface: SerialInterface):
+        """处理从 Meshtastic 接收到的消息（同步版本）"""
+        try:
+            # 确保接收时不发送（半双工通信）
+            asyncio.run_coroutine_threadsafe(self._acquire_transmit_lock_temporarily(), self.loop)
+            
+            # 检查包是否为空
+            if not packet or 'decoded' not in packet:
+                logger.warning("收到空包或无法解码的包")
+                return
+                
+            port_num = packet['decoded'].get('portnum')
+            if not port_num:
+                logger.warning("包中没有端口号")
+                return
+            
+            # 只处理我们关心的消息类型
+            if port_num == 'TEXT_MESSAGE_APP':
+                # 确保payload存在且可解码
+                if 'payload' not in packet['decoded']:
+                    logger.warning("文本消息中没有payload")
+                    return
+                    
+                try:
+                    message = packet['decoded']['payload'].decode('utf-8')
+                except Exception as e:
+                    logger.error(f"解码消息失败: {str(e)}")
+                    return
+                    
+                from_id = packet.get('fromId')
+                if not from_id:
+                    logger.warning("消息中没有发送者ID")
+                    from_id = "unknown"
+                    
+                # 安全获取节点信息
+                node_info = {}
+                with self.interface_lock:
+                    if self.interface and hasattr(self.interface, 'nodes'):
+                        node_info = self.interface.nodes.get(from_id, {})
+                
+                msg_obj = {
+                    'type': 'text',
+                    'fromId': from_id,
+                    'nodeNum': node_info.get('num', 0),
+                    'shortName': node_info.get('user', {}).get('shortName', ''),
+                    'longName': node_info.get('user', {}).get('longName', ''),
+                    'channel': packet.get('channel', 0),
+                    'message': message,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # 转发到 WebSocket
+                asyncio.run_coroutine_threadsafe(self.message_queue.put(msg_obj), self.loop)
+                logger.info(f"收到文本消息: {message} (来自Node: {from_id})")
+                
+                # 重置资源竞争计数，因为成功接收了消息
+                self.resource_contention_count = 0
+                
+            elif port_num == 'NODEINFO_APP':
+                # 处理节点信息更新
+                logger.info("收到Node信息更新")
+                self.update_node_list()
+                
+            elif port_num == 'POSITION_APP':
+                # 如果需要处理位置信息，可以在这里添加
+                pass
+            else:
+                # 对于其他类型的消息，只记录日志但不转发
+                logger.debug(f"收到未处理的消息类型: {port_num}")
+                
+        except Exception as e:
+            logger.error(f"处理 Meshtastic 消息时出错: {str(e)}")
+    
+    async def _acquire_transmit_lock_temporarily(self):
+        """临时获取发送锁，用于接收消息时阻止发送"""
+        try:
+            async with self.transmit_lock:
+                # 持有锁一小段时间，确保接收过程中不会发送
+                await asyncio.sleep(0.2)
+        except Exception as e:
+            logger.error(f"获取发送锁时出错: {str(e)}")
 
 def main():
     bridge = None
