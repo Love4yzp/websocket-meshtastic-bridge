@@ -1,5 +1,5 @@
-from pydantic import BaseSettings, Field
-from typing import Optional
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Server settings
@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     PORT: int = Field(default=5800, description="WebSocket server port")
     
     # Meshtastic settings
-    SERIAL_PORT: Optional[str] = Field(default=None, description="Serial port for Meshtastic device")
+    SERIAL_PORT: str | None = Field(default=None, description="Serial port for Meshtastic device")
     RECONNECT_ATTEMPTS: int = Field(default=3, description="Number of reconnection attempts")
     RECONNECT_DELAY: int = Field(default=5, description="Delay between reconnection attempts in seconds")
     
