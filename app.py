@@ -67,9 +67,13 @@ class MeshtasticBridge:
         except Exception as e:
             logger.error(f"处理客户端连接时出错: {str(e)}")
         finally:
-            # 移除断开的客户端
+            # 移除断开的客户端并关闭连接
             with self.lock:
                 self.connected_clients.remove(websocket)
+            try:
+                await websocket.close()
+            except Exception as e:
+                logger.error(f"关闭 WebSocket 连接时出错: {str(e)}")
             logger.info(f"客户端断开连接，当前连接数: {len(self.connected_clients)}")
     
     async def handle_client_message(self, data: Dict):
@@ -422,10 +426,30 @@ class MeshtasticBridge:
         asyncio.create_task(self.health_check())
         asyncio.create_task(self.process_message_queue())
         
-        # 启动 WebSocket 服务器
-        async with serve(self.handle_client, self.host, self.port):
-            logger.info(f"WebSocket 服务器已启动在 {self.host}:{self.port}")
-            await asyncio.Future()  # 运行直到被取消
+        try:
+            # 启动 WebSocket 服务器
+            async with serve(self.handle_client, self.host, self.port):
+                logger.info(f"WebSocket 服务器已启动在 {self.host}:{self.port}")
+                await asyncio.Future()  # 运行直到被取消
+        finally:
+            # 确保在服务器停止时清理资源
+            await self.cleanup()
+
+    async def cleanup(self):
+        """清理所有资源"""
+        # 关闭所有 WebSocket 连接
+        with self.lock:
+            for client in self.connected_clients.copy():
+                try:
+                    await client.close()
+                except Exception as e:
+                    logger.error(f"关闭 WebSocket 连接时出错: {str(e)}")
+            self.connected_clients.clear()
+        
+        # 关闭 Meshtastic 接口
+        await self._safe_close_interface()
+        
+        self.running = False
 
 def main():
     bridge = None
@@ -457,12 +481,12 @@ def main():
         logger.error(f"程序异常退出: {str(e)}")
         logger.exception("详细错误信息：")
     finally:
-        if bridge and bridge.interface:
+        if bridge:
             try:
-                bridge.interface.close()
-                logger.info("串口已关闭")
-            except:
-                pass
+                asyncio.run(bridge.cleanup())
+                logger.info("所有资源已清理")
+            except Exception as e:
+                logger.error(f"清理资源时出错: {str(e)}")
 
 if __name__ == "__main__":
     main()
